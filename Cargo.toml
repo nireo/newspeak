@@ -1,0 +1,13 @@
+[package]
+name = "newspeak"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+hex = "0.4.3"
+ml-kem = "0.2.1"
+rand = "0.8"
+sha3 = "0.10.8"
+x25519-dalek = { version = "2", features = ["reusable_secrets", "static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
