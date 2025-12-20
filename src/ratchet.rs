@@ -1,3 +1,4 @@
+use crate::pqxdh::*;
 use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit,
     aead::{AeadMut, Payload},
@@ -17,19 +18,19 @@ pub struct RatchetState {
     chain_key_receiving: [u8; 32],
 }
 
-struct RatchetMessageHeader {
+pub struct RatchetMessageHeader {
     pk: ecdh::PublicKey,
     counter: u64,
     nonce: [u8; 12],
 }
 
-struct RatchetMessage {
+pub struct RatchetMessage {
     header: RatchetMessageHeader,
     ciphertext: Vec<u8>,
 }
 
 impl RatchetState {
-    pub fn new(root_key: [u8; 32]) -> RatchetState {
+    pub fn new() -> RatchetState {
         let mut rng = rand::thread_rng();
         let sending_sk = ecdh::StaticSecret::random_from_rng(&mut rng);
         let sending_pk = ecdh::PublicKey::from(&sending_sk);
@@ -40,10 +41,24 @@ impl RatchetState {
             receiving_pk: None,
             receiving_counter: 0,
             sending_counter: 0,
-            root_key,
+            root_key: [0u8; 32],
             chain_key_sending: [0u8; 32],
             chain_key_receiving: [0u8; 32],
         }
+    }
+
+    pub fn as_initiator(&mut self, shared_key: [u8; 32], other_pk: ecdh::PublicKey) {
+        self.receiving_pk = Some(other_pk);
+
+        (self.root_key, self.chain_key_sending) = kdf_root_key(
+            &shared_key,
+            self.sending_sk.diffie_hellman(&self.receiving_pk.unwrap()), // unwrap fine since we
+                                                                         // set the value above
+        )
+    }
+
+    pub fn as_receiver(&mut self, shared_key: [u8; 32]) {
+        self.root_key = shared_key;
     }
 
     pub fn send_message(&mut self, message: &str, aditionnal_data: &[u8]) -> RatchetMessage {
@@ -160,4 +175,70 @@ fn kdf_chain_key(key: &[u8]) -> ([u8; 32], [u8; 32]) {
     xof.fill(&mut message_key);
 
     return (chain_key, message_key);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ratchet_allows_initiator_to_send_and_receiver_to_decrypt() {
+        let shared_key: [u8; 32] = rand::random();
+        let mut alice = RatchetState::new();
+        let mut bob = RatchetState::new();
+
+        let bob_pk = ecdh::PublicKey::from(&bob.sending_sk);
+        alice.as_initiator(shared_key, bob_pk);
+        bob.as_receiver(shared_key);
+
+        let ad = b"header-data";
+        let message = alice.send_message("hello", ad);
+
+        assert_eq!(alice.sending_counter, 1);
+        assert_eq!(bob.receiving_counter, 0);
+
+        bob.receive_message(message, ad);
+
+        assert_eq!(bob.receiving_counter, 1);
+        assert_eq!(bob.receiving_pk, Some(alice.sending_pk));
+    }
+
+    #[test]
+    fn ratchet_allows_bidirectional_messages() {
+        let shared_key: [u8; 32] = rand::random();
+        let mut alice = RatchetState::new();
+        let mut bob = RatchetState::new();
+
+        let bob_initial_pk = ecdh::PublicKey::from(&bob.sending_sk);
+        alice.as_initiator(shared_key, bob_initial_pk);
+        bob.as_receiver(shared_key);
+
+        let ad = b"ratchet-ad";
+        let to_bob = alice.send_message("ping", ad);
+        bob.receive_message(to_bob, ad);
+
+        let bob_reply_pk = ecdh::PublicKey::from(&bob.sending_sk);
+        let to_alice = bob.send_message("pong", ad);
+        alice.receive_message(to_alice, ad);
+
+        assert_eq!(alice.receiving_pk, Some(bob_reply_pk));
+        assert_eq!(alice.receiving_counter, 1);
+        assert_eq!(bob.sending_counter, 1);
+        assert_eq!(bob.receiving_counter, 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn ratchet_rejects_message_with_wrong_additional_data() {
+        let shared_key: [u8; 32] = rand::random();
+        let mut alice = RatchetState::new();
+        let mut bob = RatchetState::new();
+
+        let bob_pk = ecdh::PublicKey::from(&bob.sending_sk);
+        alice.as_initiator(shared_key, bob_pk);
+        bob.as_receiver(shared_key);
+
+        let message = alice.send_message("secret", b"correct-ad");
+        bob.receive_message(message, b"incorrect-ad");
+    }
 }

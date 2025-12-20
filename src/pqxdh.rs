@@ -1,3 +1,5 @@
+use std::{collections::HashMap, hash::Hash};
+
 use anyhow::{Context, Error};
 use ed25519_dalek::{self as ed25519, ed25519::signature::SignerMut};
 use ml_kem::{
@@ -10,42 +12,59 @@ use sha3::{
 };
 use x25519_dalek as x25519;
 
-struct KeyExchangeUser {
-    identity_sk: ed25519::SigningKey,
-    identity_pk: ed25519::VerifyingKey,
+pub struct KeyExchangeUser {
+    pub identity_sk: ed25519::SigningKey,
+    pub identity_pk: ed25519::VerifyingKey,
 
-    signed_prekey_sk: x25519::ReusableSecret,
-    signed_prekey: SignedX25519Prekey,
+    pub signed_prekey_sk: x25519::ReusableSecret,
+    pub signed_prekey: SignedPrekey,
 
-    last_resort_decap: DecapsulationKey<MlKem1024Params>,
-    last_resort_pk: SignedMlKemPrekey,
+    pub last_resort_decap: DecapsulationKey<MlKem1024Params>,
+    pub last_resort_pk: SignedMlKemPrekey,
 }
 
-struct SignedX25519Prekey {
+pub struct OneTimeKey<T> {
+    key: T,
+}
+
+pub struct KeyStore<I: Hash, T> {
+    store: HashMap<I, OneTimeKey<T>>,
+}
+
+impl<I: Hash, T> KeyStore<I, T> {
+    pub fn new() -> Self {
+        Self {
+            store: HashMap::new(),
+        }
+    }
+}
+
+pub struct SignedPrekey {
     public_key: x25519::PublicKey,
     signature: ed25519::Signature,
 }
 
-struct SignedMlKemPrekey {
+pub struct SignedMlKemPrekey {
     encap_key: EncapsulationKey<MlKem1024Params>,
     signature: ed25519::Signature,
 }
 
-struct PQXDHInitOutput {
+pub struct PQXDHInitOutput {
     secret_key: [u8; 32],
     message: PQXDHInitMessage,
 }
 
-struct PQXDHInitMessage {
+pub struct PQXDHInitMessage {
     peer_identity_public_key: ed25519::VerifyingKey,
     ephemeral_x25519_public_key: x25519::PublicKey,
     mlkem_ciphertext: Vec<u8>,
 }
 
-struct PrekeyBundle {
-    signed_prekey: SignedX25519Prekey,
+pub struct PrekeyBundle {
+    signed_prekey: SignedPrekey,
     kem_prekey: SignedMlKemPrekey,
     identity_pk: ed25519::VerifyingKey,
+    one_time_pk: Option<SignedPrekey>,
 }
 
 impl KeyExchangeUser {
@@ -59,7 +78,7 @@ impl KeyExchangeUser {
         let x25519_public_prekey = x25519::PublicKey::from(&x25519_private_key);
         let x25519_public_prekey_signature =
             identity_private_key.sign(x25519_public_prekey.as_bytes());
-        let x25519_prekey = SignedX25519Prekey {
+        let x25519_prekey = SignedPrekey {
             public_key: x25519_public_prekey,
             signature: x25519_public_prekey_signature,
         };
@@ -183,7 +202,7 @@ impl KeyExchangeUser {
 
     fn make_prekey(&self) -> PrekeyBundle {
         PrekeyBundle {
-            signed_prekey: SignedX25519Prekey {
+            signed_prekey: SignedPrekey {
                 public_key: self.signed_prekey.public_key,
                 signature: self.signed_prekey.signature,
             },
@@ -192,6 +211,7 @@ impl KeyExchangeUser {
                 signature: self.last_resort_pk.signature,
             },
             identity_pk: self.identity_pk,
+            one_time_pk: None,
         }
     }
 }
