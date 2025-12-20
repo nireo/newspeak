@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+message Foo {
+  int32 bar = 1;
+}
+
+service Newspeak {
+  rpc Test(Foo) returns (Foo) {}
+}
