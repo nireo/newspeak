@@ -10,7 +10,6 @@ use newspeak::{
     FetchPrekeyBundleRequest, FetchPrekeyBundleResponse, RegisterRequest, RegisterResponse,
     SignedPrekey,
 };
-use prost_types::Timestamp;
 use std::sync::Arc;
 use tokio_rusqlite::Connection;
 use tokio_rusqlite::Error as TokioRusqliteError;
@@ -54,24 +53,20 @@ impl Newspeak for NewspeakService {
         db.call(move |conn| {
             let tx = conn.transaction()?;
 
-            let signed_prekey_created_at =
-                timestamp_to_unix_nanos(signed_prekey.created_at.as_ref());
             tx.execute(
                 "INSERT INTO users (
                     username,
                     identity_key,
                     signed_prekey_kind,
                     signed_prekey_key,
-                    signed_prekey_signature,
-                    signed_prekey_created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    signed_prekey_signature
+                ) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     username,
                     identity_key,
                     signed_prekey.kind,
                     signed_prekey.key,
-                    signed_prekey.signature,
-                    signed_prekey_created_at
+                    signed_prekey.signature
                 ],
             )?;
 
@@ -98,32 +93,23 @@ impl Newspeak for NewspeakService {
     }
 }
 
-fn timestamp_to_unix_nanos(ts: Option<&Timestamp>) -> Option<i64> {
-    ts.map(|ts| ts.seconds.saturating_mul(1_000_000_000) + i64::from(ts.nanos))
-}
-
 fn insert_one_time_key(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
     user_id: i64,
     prekey: &SignedPrekey,
 ) -> Result<(), RusqliteError> {
-    let created_at = timestamp_to_unix_nanos(prekey.created_at.as_ref());
     let sql = format!(
         "INSERT INTO {} (
             user_id,
             kind,
             key,
-            signature,
-            created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            signature
+        ) VALUES (?1, ?2, ?3, ?4)",
         table
     );
 
-    tx.execute(
-        &sql,
-        params![user_id, prekey.kind, prekey.key, prekey.signature, created_at],
-    )?;
+    tx.execute(&sql, params![user_id, prekey.kind, prekey.key, prekey.signature])?;
     Ok(())
 }
 
@@ -189,10 +175,6 @@ mod tests {
             kind: kind as i32,
             key: key.to_vec(),
             signature: signature.to_vec(),
-            created_at: Some(Timestamp {
-                seconds: 1_700_000_000,
-                nanos: 123,
-            }),
         }
     }
 

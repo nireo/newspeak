@@ -30,3 +30,7 @@ tonic-prost-build = "0.14.2"
 [[bin]]
 name = "server"
 path = "src/server.rs"
+
+[[bin]]
+name = "client"
+path = "src/client.rs"

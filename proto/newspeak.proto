@@ -18,7 +18,6 @@ message SignedPrekey {
   KeyKind kind = 1;
   bytes key = 2;
   bytes signature = 3;
-  google.protobuf.Timestamp created_at = 4;
 }
 
 message PrekeyBundle {
@@ -41,7 +40,6 @@ message RegisterRequest {
   bytes identity_key = 2;
   SignedPrekey signed_prekey = 3;
   repeated SignedPrekey one_time_prekeys = 4;
-  repeated SignedPrekey one_time_kem_keys = 5;
 }
 
 message RegisterResponse {
