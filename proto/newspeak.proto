@@ -1,9 +1,49 @@
 syntax = "proto3";
 
-message Foo {
-  int32 bar = 1;
+package newspeak;
+
+import "google/protobuf/timestamp.proto";
+
+enum KeyKind {
+  ML_KEM_1024 = 0;
+  X25519 = 1;
 }
 
 service Newspeak {
-  rpc Test(Foo) returns (Foo) {}
+  rpc FetchPrekeyBundle(FetchPrekeyBundleRequest) returns (FetchPrekeyBundleResponse) {}
+  rpc Register(RegisterRequest) returns (RegisterResponse) {}
+}
+
+message SignedPrekey {
+  KeyKind kind = 1;
+  bytes key = 2;
+  bytes signature = 3;
+  google.protobuf.Timestamp created_at = 4;
+}
+
+message PrekeyBundle {
+  bytes identity_key = 1;
+  SignedPrekey signed_prekey = 2;
+  SignedPrekey kem_encap_key = 3;
+  optional SignedPrekey one_time_prekey = 4;
+}
+
+message FetchPrekeyBundleRequest {
+  string username = 1;
+}
+
+message FetchPrekeyBundleResponse {
+  PrekeyBundle bundle = 1;
+}
+
+message RegisterRequest {
+  string username = 1;
+  bytes identity_key = 2;
+  SignedPrekey signed_prekey = 3;
+  repeated SignedPrekey one_time_prekeys = 4;
+  repeated SignedPrekey one_time_kem_keys = 5;
+}
+
+message RegisterResponse {
+  bytes auth_challenge = 1;
 }
