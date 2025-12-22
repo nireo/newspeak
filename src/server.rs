@@ -7,15 +7,16 @@ pub mod newspeak {
 
 use newspeak::newspeak_server::{Newspeak, NewspeakServer};
 use newspeak::{
-    FetchPrekeyBundleRequest, FetchPrekeyBundleResponse, RegisterRequest, RegisterResponse,
-    SignedPrekey,
+    FetchPrekeyBundleRequest, FetchPrekeyBundleResponse, PrekeyBundle, RegisterRequest,
+    RegisterResponse, SignedPrekey,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_rusqlite::Connection;
 use tokio_rusqlite::Error as TokioRusqliteError;
-use tokio_rusqlite::rusqlite::{self, Error as RusqliteError, params};
+use tokio_rusqlite::rusqlite::{self, Error as RusqliteError, OptionalExtension, params};
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::newspeak::{ClientMessage, ServerMessage};
@@ -31,9 +32,81 @@ impl Newspeak for NewspeakService {
 
     async fn fetch_prekey_bundle(
         &self,
-        _request: Request<FetchPrekeyBundleRequest>,
+        request: Request<FetchPrekeyBundleRequest>,
     ) -> Result<Response<FetchPrekeyBundleResponse>, Status> {
-        let reply = FetchPrekeyBundleResponse { bundle: None };
+        let request = request.into_inner();
+        if request.username.is_empty() {
+            return Err(Status::invalid_argument("username is required"));
+        }
+
+        let username = request.username;
+        let db = Arc::clone(&self.db);
+        let bundle = db
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+
+                let user_row: Option<(i64, Vec<u8>, SignedPrekey)> = tx
+                    .query_row(
+                        "SELECT id, identity_key, signed_prekey_kind, signed_prekey_key, signed_prekey_signature
+                        FROM users
+                        WHERE username = ?1",
+                        params![username],
+                        |row| {
+                            let user_id: i64 = row.get(0)?;
+                            let identity_key: Vec<u8> = row.get(1)?;
+                            let signed_prekey_kind: i32 = row.get(2)?;
+                            let signed_prekey_key: Vec<u8> = row.get(3)?;
+                            let signed_prekey_signature: Vec<u8> = row.get(4)?;
+                            Ok((
+                                user_id,
+                                identity_key,
+                                SignedPrekey {
+                                    kind: signed_prekey_kind,
+                                    key: signed_prekey_key,
+                                    signature: signed_prekey_signature,
+                                },
+                            ))
+                        },
+                    )
+                    .optional()?;
+
+                let Some((user_id, identity_key, signed_prekey)) = user_row else {
+                    return Ok(None);
+                };
+
+                let kem_encap_key = take_one_time_key(&tx, "one_time_kem_keys", user_id)?;
+                if kem_encap_key.is_none() {
+                    tx.commit()?;
+                    return Ok(Some(PrekeyBundle {
+                        identity_key,
+                        signed_prekey: Some(signed_prekey),
+                        kem_encap_key: None,
+                        one_time_prekey: None,
+                    }));
+                }
+
+                let one_time_prekey = take_one_time_key(&tx, "one_time_prekeys", user_id)?;
+
+                tx.commit()?;
+
+                Ok(Some(PrekeyBundle {
+                    identity_key,
+                    signed_prekey: Some(signed_prekey),
+                    kem_encap_key,
+                    one_time_prekey,
+                }))
+            })
+            .await
+            .map_err(map_db_error)?;
+
+        let bundle = bundle.ok_or_else(|| Status::not_found("username not registered"))?;
+        if bundle.kem_encap_key.is_none() {
+            return Err(Status::failed_precondition("kem prekey unavailable"));
+        }
+
+        let reply = FetchPrekeyBundleResponse {
+            bundle: Some(bundle),
+        };
         Ok(Response::new(reply))
     }
 
@@ -138,6 +211,46 @@ fn insert_one_time_key(
         params![user_id, prekey.kind, prekey.key, prekey.signature],
     )?;
     Ok(())
+}
+
+fn take_one_time_key(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    user_id: i64,
+) -> Result<Option<SignedPrekey>, RusqliteError> {
+    let sql = format!(
+        "SELECT id, kind, key, signature
+        FROM {}
+        WHERE user_id = ?1
+        ORDER BY id
+        LIMIT 1",
+        table
+    );
+
+    let row: Option<(i64, SignedPrekey)> = tx
+        .query_row(&sql, params![user_id], |row| {
+            let id: i64 = row.get(0)?;
+            let kind: i32 = row.get(1)?;
+            let key: Vec<u8> = row.get(2)?;
+            let signature: Vec<u8> = row.get(3)?;
+            Ok((
+                id,
+                SignedPrekey {
+                    kind,
+                    key,
+                    signature,
+                },
+            ))
+        })
+        .optional()?;
+
+    if let Some((id, prekey)) = row {
+        let delete_sql = format!("DELETE FROM {} WHERE id = ?1", table);
+        tx.execute(&delete_sql, params![id])?;
+        Ok(Some(prekey))
+    } else {
+        Ok(None)
+    }
 }
 
 fn map_db_error(err: TokioRusqliteError<RusqliteError>) -> Status {
@@ -254,6 +367,65 @@ mod tests {
         svc.register(Request::new(request.clone())).await.unwrap();
         let err = svc.register(Request::new(request)).await.unwrap_err();
         assert_eq!(err.code(), Code::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn fetch_prekey_bundle_returns_and_consumes_keys() {
+        let svc = test_service().await;
+        let request = RegisterRequest {
+            username: "carol".to_string(),
+            identity_key: vec![1],
+            signed_prekey: Some(sample_prekey(KeyKind::X25519, &[2], &[3])),
+            one_time_prekeys: vec![sample_prekey(KeyKind::X25519, &[4], &[5])],
+        };
+
+        svc.register(Request::new(request)).await.unwrap();
+
+        let kem_prekey = sample_prekey(KeyKind::MlKem1024, &[6], &[7]);
+        svc.db
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                let user_id: i64 = tx.query_row(
+                    "SELECT id FROM users WHERE username = ?1",
+                    params!["carol"],
+                    |row| row.get(0),
+                )?;
+                insert_one_time_key(&tx, "one_time_kem_keys", user_id, &kem_prekey)?;
+                tx.commit()?;
+                Ok::<(), RusqliteError>(())
+            })
+            .await
+            .unwrap();
+
+        let response = svc
+            .fetch_prekey_bundle(Request::new(FetchPrekeyBundleRequest {
+                username: "carol".to_string(),
+            }))
+            .await
+            .unwrap();
+        let bundle = response.into_inner().bundle.unwrap();
+        assert_eq!(bundle.identity_key, vec![1]);
+        assert_eq!(bundle.signed_prekey.unwrap().key, vec![2]);
+        assert_eq!(bundle.kem_encap_key.unwrap().key, vec![6]);
+        assert_eq!(bundle.one_time_prekey.unwrap().key, vec![4]);
+
+        let counts = svc
+            .db
+            .call(|conn| {
+                let prekey_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM one_time_prekeys", [], |row| {
+                        row.get(0)
+                    })?;
+                let kem_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM one_time_kem_keys", [], |row| {
+                        row.get(0)
+                    })?;
+                Ok::<(i64, i64), RusqliteError>((prekey_count, kem_count))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(counts, (0, 0));
     }
 }
 
