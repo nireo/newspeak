@@ -17,12 +17,12 @@ pub struct KeyExchangeUser {
     pub identity_pk: ed25519::VerifyingKey,
 
     pub signed_prekey_sk: x25519::ReusableSecret,
-    pub signed_prekey: Prekey,
+    pub signed_prekey: SignedPrekey,
 
     pub last_resort_decap: DecapsulationKey<MlKem1024Params>,
-    pub last_resort_pk: Prekey,
+    pub last_resort_pk: SignedMlKemPrekey,
 
-    pub one_time_keys: Vec<Prekey>,
+    pub one_time_keys: Vec<SignedPrekey>,
 }
 
 pub struct OneTimeKey<T> {
@@ -41,38 +41,14 @@ impl<I: Hash, T> KeyStore<I, T> {
     }
 }
 
-#[derive(Clone)]
-pub enum Prekey {
-    EC {
-        public_key: x25519::PublicKey,
-        signature: ed25519::Signature,
-    },
-    MlKem {
-        encap_key: EncapsulationKey<MlKem1024Params>,
-        signature: ed25519::Signature,
-    },
+pub struct SignedPrekey {
+    pub public_key: x25519::PublicKey,
+    pub signature: ed25519::Signature,
 }
 
-impl Prekey {
-    fn as_ec(&self) -> Option<(&x25519::PublicKey, &ed25519::Signature)> {
-        match self {
-            Prekey::EC {
-                public_key,
-                signature,
-            } => Some((public_key, signature)),
-            _ => None,
-        }
-    }
-
-    fn as_mlkem(&self) -> Option<(&EncapsulationKey<MlKem1024Params>, &ed25519::Signature)> {
-        match self {
-            Prekey::MlKem {
-                encap_key,
-                signature,
-            } => Some((encap_key, signature)),
-            _ => None,
-        }
-    }
+pub struct SignedMlKemPrekey {
+    pub encap_key: EncapsulationKey<MlKem1024Params>,
+    pub signature: ed25519::Signature,
 }
 
 pub struct PQXDHInitOutput {
@@ -87,10 +63,10 @@ pub struct PQXDHInitMessage {
 }
 
 pub struct PrekeyBundle {
-    signed_prekey: Prekey,
-    kem_prekey: Prekey,
+    signed_prekey: SignedPrekey,
+    kem_prekey: SignedMlKemPrekey,
     identity_pk: ed25519::VerifyingKey,
-    one_time_pk: Option<Prekey>,
+    one_time_pk: Option<SignedPrekey>,
 }
 
 impl KeyExchangeUser {
@@ -104,7 +80,7 @@ impl KeyExchangeUser {
         let x25519_public_prekey = x25519::PublicKey::from(&x25519_private_key);
         let x25519_public_prekey_signature =
             identity_private_key.sign(x25519_public_prekey.as_bytes());
-        let x25519_prekey = Prekey::EC {
+        let x25519_prekey = SignedPrekey {
             public_key: x25519_public_prekey,
             signature: x25519_public_prekey_signature,
         };
@@ -112,7 +88,7 @@ impl KeyExchangeUser {
         let (mlkem1024_decap_key, mlkem1024_encap_key) = MlKem1024::generate(&mut rng);
         let mlkem1024_encap_key_signautre =
             identity_private_key.sign(&mlkem1024_encap_key.as_bytes());
-        let mlkem1024_prekey = Prekey::MlKem {
+        let mlkem1024_prekey = SignedMlKemPrekey {
             encap_key: mlkem1024_encap_key,
             signature: mlkem1024_encap_key_signautre,
         };
@@ -124,28 +100,26 @@ impl KeyExchangeUser {
             signed_prekey: x25519_prekey,
             last_resort_decap: mlkem1024_decap_key,
             last_resort_pk: mlkem1024_prekey,
+            one_time_keys: Vec::new(),
         };
     }
 
     fn init_key_exchange(&self, other: &PrekeyBundle) -> Result<PQXDHInitOutput, Error> {
         let mut rng = rand::thread_rng();
 
-        let (signed_prekey_pk, signed_prekey_sig) = other
-            .signed_prekey
-            .as_ec()
-            .ok_or_else(|| Error::msg("expected X25519 signed prekey"))?;
-        let (kem_prekey_pk, kem_prekey_sig) = other
-            .kem_prekey
-            .as_mlkem()
-            .ok_or_else(|| Error::msg("expected ML-KEM-1024 prekey"))?;
-
         other
             .identity_pk
-            .verify_strict(signed_prekey_pk.as_bytes(), signed_prekey_sig)
+            .verify_strict(
+                other.signed_prekey.public_key.as_bytes(),
+                &other.signed_prekey.signature,
+            )
             .with_context(|| "failed to verify X25519 prekey")?;
         other
             .identity_pk
-            .verify_strict(&kem_prekey_pk.as_bytes(), kem_prekey_sig)
+            .verify_strict(
+                &other.kem_prekey.encap_key.as_bytes(),
+                &other.kem_prekey.signature,
+            )
             .with_context(|| "failed to verify ML-KEM-1024 prekey")?;
 
         // we cannot use the x25519::EmphemeralSecret since we need to use the key multiple times.
@@ -153,7 +127,9 @@ impl KeyExchangeUser {
         // inside here.
         let ephemeral_sk = x25519::ReusableSecret::random_from_rng(&mut rng);
 
-        let (mlkem_ciphertext, mlkem_shared_secret) = kem_prekey_pk
+        let (mlkem_ciphertext, mlkem_shared_secret) = other
+            .kem_prekey
+            .encap_key
             .encapsulate(&mut rng)
             .map_err(|_| Error::msg("failed to encapsulate with ML-KEM-1024"))?;
 
@@ -161,11 +137,11 @@ impl KeyExchangeUser {
         let other_identity_ecdh = ed25519_pk_to_x25519(&other.identity_pk);
 
         // DH1 = DH(IKA, SPKB)
-        let dh_1 = self_identity_ecdh.diffie_hellman(signed_prekey_pk);
+        let dh_1 = self_identity_ecdh.diffie_hellman(&other.signed_prekey.public_key);
         // DH2 = DH(EKA, IKB)
         let dh_2 = ephemeral_sk.diffie_hellman(&other_identity_ecdh);
         // DH3 = DH(EKA, SPKB)
-        let dh_3 = ephemeral_sk.diffie_hellman(signed_prekey_pk);
+        let dh_3 = ephemeral_sk.diffie_hellman(&other.signed_prekey.public_key);
 
         // SK = KDF(DH1 || DH2 || DH3 || SS)
         let secret_key = kdf(
@@ -229,8 +205,14 @@ impl KeyExchangeUser {
 
     fn make_prekey(&self) -> PrekeyBundle {
         PrekeyBundle {
-            signed_prekey: self.signed_prekey.clone(),
-            kem_prekey: self.last_resort_pk.clone(),
+            signed_prekey: SignedPrekey {
+                public_key: self.signed_prekey.public_key,
+                signature: self.signed_prekey.signature,
+            },
+            kem_prekey: SignedMlKemPrekey {
+                encap_key: self.last_resort_pk.encap_key.clone(),
+                signature: self.last_resort_pk.signature,
+            },
             identity_pk: self.identity_pk,
             one_time_pk: None,
         }
@@ -285,15 +267,8 @@ mod tests {
 
         let mut rng = rand::thread_rng();
         let mut fake_signer = ed25519::SigningKey::generate(&mut rng);
-        if let Prekey::EC {
-            public_key,
-            signature,
-        } = &mut bob_bundle.signed_prekey
-        {
-            *signature = fake_signer.sign(public_key.as_bytes());
-        } else {
-            panic!("expected X25519 signed prekey");
-        }
+        bob_bundle.signed_prekey.signature =
+            fake_signer.sign(bob_bundle.signed_prekey.public_key.as_bytes());
 
         assert!(alice.init_key_exchange(&bob_bundle).is_err());
     }
@@ -306,15 +281,8 @@ mod tests {
 
         let mut rng = rand::thread_rng();
         let mut fake_signer = ed25519::SigningKey::generate(&mut rng);
-        if let Prekey::MlKem {
-            encap_key,
-            signature,
-        } = &mut bob_bundle.kem_prekey
-        {
-            *signature = fake_signer.sign(&encap_key.as_bytes());
-        } else {
-            panic!("expected ML-KEM-1024 prekey");
-        }
+        bob_bundle.kem_prekey.signature =
+            fake_signer.sign(&bob_bundle.kem_prekey.encap_key.as_bytes());
 
         assert!(alice.init_key_exchange(&bob_bundle).is_err());
     }

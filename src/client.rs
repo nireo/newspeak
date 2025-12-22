@@ -9,7 +9,7 @@ use crate::{
 };
 use anyhow::{Ok, Result};
 use ml_kem::EncodedSizeUser;
-use tonic::{Request, transport::Channel};
+use tonic::transport::Channel;
 
 struct User<'a> {
     username: &'a str,
@@ -17,25 +17,22 @@ struct User<'a> {
     client: NewspeakClient<Channel>,
 }
 
-impl From<pqxdh::Prekey> for newspeak::SignedPrekey {
-    fn from(k: pqxdh::Prekey) -> Self {
-        match k {
-            pqxdh::Prekey::EC {
-                public_key,
-                signature,
-            } => newspeak::SignedPrekey {
-                kind: KeyKind::X25519.into(),
-                key: public_key.as_bytes().to_vec(),
-                signature: signature.to_vec(),
-            },
-            pqxdh::Prekey::MlKem {
-                encap_key,
-                signature,
-            } => newspeak::SignedPrekey {
-                kind: KeyKind::X25519.into(),
-                key: encap_key.as_bytes().as_slice().to_vec(),
-                signature: signature.to_vec(),
-            },
+impl From<&pqxdh::SignedPrekey> for newspeak::SignedPrekey {
+    fn from(k: &pqxdh::SignedPrekey) -> Self {
+        newspeak::SignedPrekey {
+            kind: KeyKind::X25519.into(),
+            key: k.public_key.as_bytes().to_vec(),
+            signature: k.signature.to_vec(),
+        }
+    }
+}
+
+impl From<&pqxdh::SignedMlKemPrekey> for newspeak::SignedPrekey {
+    fn from(k: &pqxdh::SignedMlKemPrekey) -> Self {
+        newspeak::SignedPrekey {
+            kind: KeyKind::MlKem1024.into(),
+            key: k.encap_key.as_bytes().as_slice().to_vec(),
+            signature: k.signature.to_vec(),
         }
     }
 }
@@ -45,8 +42,13 @@ impl<'a> User<'a> {
         let req = RegisterRequest {
             username: self.username.into(),
             identity_key: self.key_info.identity_pk.as_bytes().to_vec(),
-            signed_prekey: Some(self.key_info.signed_prekey.into()),
-            one_time_prekeys: self.key_info.one_time_keys.iter().map(),
+            signed_prekey: Some((&self.key_info.signed_prekey).into()),
+            one_time_prekeys: self
+                .key_info
+                .one_time_keys
+                .iter()
+                .map(Into::into)
+                .collect(),
         };
 
         Ok(())

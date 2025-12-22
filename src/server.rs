@@ -47,8 +47,6 @@ impl Newspeak for NewspeakService {
         let username = request.username;
         let identity_key = request.identity_key;
         let one_time_prekeys = request.one_time_prekeys;
-        let one_time_kem_keys = request.one_time_kem_keys;
-
         let db = Arc::clone(&self.db);
         db.call(move |conn| {
             let tx = conn.transaction()?;
@@ -74,10 +72,6 @@ impl Newspeak for NewspeakService {
 
             for prekey in one_time_prekeys {
                 insert_one_time_key(&tx, "one_time_prekeys", user_id, &prekey)?;
-            }
-
-            for prekey in one_time_kem_keys {
-                insert_one_time_key(&tx, "one_time_kem_keys", user_id, &prekey)?;
             }
 
             tx.commit()?;
@@ -192,7 +186,6 @@ mod tests {
             identity_key: vec![1, 2, 3],
             signed_prekey: Some(sample_prekey(KeyKind::X25519, &[4, 5], &[6])),
             one_time_prekeys: vec![sample_prekey(KeyKind::X25519, &[7], &[8])],
-            one_time_kem_keys: vec![sample_prekey(KeyKind::MlKem1024, &[9], &[10])],
         };
 
         let response = svc.register(Request::new(request)).await.unwrap();
@@ -207,16 +200,12 @@ mod tests {
                     conn.query_row("SELECT COUNT(*) FROM one_time_prekeys", [], |row| {
                         row.get(0)
                     })?;
-                let kem_count: i64 =
-                    conn.query_row("SELECT COUNT(*) FROM one_time_kem_keys", [], |row| {
-                        row.get(0)
-                    })?;
-                Ok::<(i64, i64, i64), RusqliteError>((user_count, prekey_count, kem_count))
+                Ok::<(i64, i64), RusqliteError>((user_count, prekey_count))
             })
             .await
             .unwrap();
 
-        assert_eq!(counts, (1, 1, 1));
+        assert_eq!(counts, (1, 1));
     }
 
     #[tokio::test]
@@ -227,7 +216,6 @@ mod tests {
             identity_key: vec![11, 12],
             signed_prekey: Some(sample_prekey(KeyKind::X25519, &[13], &[14])),
             one_time_prekeys: vec![],
-            one_time_kem_keys: vec![],
         };
 
         svc.register(Request::new(request.clone())).await.unwrap();
