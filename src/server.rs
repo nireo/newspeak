@@ -11,11 +11,14 @@ use newspeak::{
     SignedPrekey,
 };
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio_rusqlite::Connection;
 use tokio_rusqlite::Error as TokioRusqliteError;
 use tokio_rusqlite::rusqlite::{self, Error as RusqliteError, params};
-use tonic::transport::Server;
-use tonic::{Request, Response, Status};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status, Streaming};
+
+use crate::newspeak::{ClientMessage, ServerMessage};
 
 #[derive(Clone)]
 struct NewspeakService {
@@ -24,12 +27,39 @@ struct NewspeakService {
 
 #[tonic::async_trait]
 impl Newspeak for NewspeakService {
+    type MessageStreamStream = ReceiverStream<Result<ServerMessage, Status>>;
+
     async fn fetch_prekey_bundle(
         &self,
         _request: Request<FetchPrekeyBundleRequest>,
     ) -> Result<Response<FetchPrekeyBundleResponse>, Status> {
         let reply = FetchPrekeyBundleResponse { bundle: None };
         Ok(Response::new(reply))
+    }
+
+    async fn message_stream(
+        &self,
+        request: Request<Streaming<ClientMessage>>,
+    ) -> Result<Response<ReceiverStream<Result<ServerMessage, Status>>>, Status> {
+        let mut inbound = request.into_inner();
+        let (tx, rx) = mpsc::channel(32);
+
+        tokio::spawn(async move {
+            while let Some(message) = inbound.message().await.transpose() {
+                match message {
+                    Ok(client_message) => {
+                        // TODO: convert ClientMessage -> ServerMessage and send over tx.
+                        let _ = client_message;
+                    }
+                    Err(status) => {
+                        let _ = tx.send(Err(status)).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn register(
@@ -103,7 +133,10 @@ fn insert_one_time_key(
         table
     );
 
-    tx.execute(&sql, params![user_id, prekey.kind, prekey.key, prekey.signature])?;
+    tx.execute(
+        &sql,
+        params![user_id, prekey.kind, prekey.key, prekey.signature],
+    )?;
     Ok(())
 }
 

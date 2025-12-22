@@ -12,6 +12,7 @@ enum KeyKind {
 service Newspeak {
   rpc FetchPrekeyBundle(FetchPrekeyBundleRequest) returns (FetchPrekeyBundleResponse) {}
   rpc Register(RegisterRequest) returns (RegisterResponse) {}
+  rpc MessageStream(stream ClientMessage) returns (stream ServerMessage) {}
 }
 
 message SignedPrekey {
@@ -44,4 +45,59 @@ message RegisterRequest {
 
 message RegisterResponse {
   bytes auth_challenge = 1;
+}
+
+message JoinRequest {
+  string username = 1;
+  bytes signature = 2;
+}
+
+message JoinResponse {
+  string message = 1;
+  google.protobuf.Timestamp timestamp = 2;
+}
+
+message InitialMessage {
+  bytes identity_key = 1;
+  bytes ephemeral_key = 2;
+  bytes kem_ciphertext = 3;
+  optional bytes one_time_prekey = 4;
+}
+
+message KeyExchangeMessage {
+  string sender_id = 1;
+  string receiver_id = 2;
+  InitialMessage initial_message = 3;
+  google.protobuf.Timestamp timestamp = 4;
+}
+
+message EncryptedMessage {
+  string sender_id = 1;
+  string receiver_id = 2;
+  RatchetMessage ratchet_message = 3;
+  google.protobuf.Timestamp timestamp = 4;
+}
+
+message RatchetMessage {
+  bytes public_key = 1;
+  int32 previous_chain_length = 2;
+  int32 message_number = 3;
+  bytes ciphertext = 4;
+  bytes nonce = 5;
+}
+
+message ClientMessage {
+  oneof message_type {
+    JoinRequest join_request = 1;
+    KeyExchangeMessage key_exchange_message = 2;
+    EncryptedMessage encrypted_message = 3;
+  }
+}
+
+message ServerMessage {
+  oneof message_type {
+    JoinResponse join_response = 1;
+    KeyExchangeMessage key_exchange = 2;
+    EncryptedMessage encrypted = 3;
+  }
 }

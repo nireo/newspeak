@@ -53,6 +53,8 @@ pub struct SignedMlKemPrekey {
 
 pub struct PQXDHInitOutput {
     secret_key: [u8; 32],
+
+    // The message here is public information as is to be shared.
     message: PQXDHInitMessage,
 }
 
@@ -70,7 +72,7 @@ pub struct PrekeyBundle {
 }
 
 impl KeyExchangeUser {
-    fn new() -> KeyExchangeUser {
+    pub fn new() -> KeyExchangeUser {
         let mut rng = rand::thread_rng();
 
         let mut identity_private_key = ed25519::SigningKey::generate(&mut rng);

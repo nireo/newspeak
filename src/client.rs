@@ -38,28 +38,38 @@ impl From<&pqxdh::SignedMlKemPrekey> for newspeak::SignedPrekey {
 }
 
 impl<'a> User<'a> {
-    async fn register(&self) -> Result<()> {
+    pub fn new(username: &'a str, client: NewspeakClient<Channel>) -> Self {
+        User {
+            username,
+            key_info: pqxdh::KeyExchangeUser::new(),
+            client,
+        }
+    }
+
+    pub async fn register(&mut self) -> Result<()> {
         let req = RegisterRequest {
             username: self.username.into(),
             identity_key: self.key_info.identity_pk.as_bytes().to_vec(),
             signed_prekey: Some((&self.key_info.signed_prekey).into()),
-            one_time_prekeys: self
-                .key_info
-                .one_time_keys
-                .iter()
-                .map(Into::into)
-                .collect(),
+            one_time_prekeys: self.key_info.one_time_keys.iter().map(Into::into).collect(),
         };
 
+        self.client.register(req).await?;
         Ok(())
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // TODO: actual persistance of client state
+
     println!("hello from client");
     let args: Vec<String> = std::env::args().collect();
-    let mut client = NewspeakClient::connect("http://[::1]:10000").await?;
+    let client = NewspeakClient::connect("http://[::1]:10000").await?;
+
+    let mut user = User::new(&args[1], client);
+
+    println!("logged in as: {}", user.username);
 
     Ok(())
 }
