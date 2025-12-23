@@ -5,13 +5,15 @@ pub mod newspeak {
     tonic::include_proto!("newspeak");
 }
 
+use blake3;
 use newspeak::newspeak_server::{Newspeak, NewspeakServer};
 use newspeak::{
     FetchPrekeyBundleRequest, FetchPrekeyBundleResponse, PrekeyBundle, RegisterRequest,
     RegisterResponse, SignedPrekey,
 };
-use blake3;
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio_rusqlite::Connection;
 use tokio_rusqlite::Error as TokioRusqliteError;
@@ -20,11 +22,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::newspeak::{ClientMessage, ServerMessage};
+use crate::newspeak::{ClientMessage, JoinResponse, ServerMessage, client_message, server_message};
 
 #[derive(Clone)]
 struct NewspeakService {
     db: Arc<Connection>,
+    users: Arc<Mutex<HashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>>,
 }
 
 struct StoredPrekey {
@@ -132,19 +135,84 @@ impl Newspeak for NewspeakService {
     ) -> Result<Response<ReceiverStream<Result<ServerMessage, Status>>>, Status> {
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(32);
+        let users = Arc::clone(&self.users);
 
         tokio::spawn(async move {
+            let mut active_username: Option<String> = None;
             while let Some(message) = inbound.message().await.transpose() {
                 match message {
-                    Ok(client_message) => {
-                        // TODO: convert ClientMessage -> ServerMessage and send over tx.
-                        let _ = client_message;
-                    }
+                    Ok(client_message) => match client_message.message_type {
+                        Some(client_message::MessageType::JoinRequest(join_request)) => {
+                            if join_request.username.is_empty() {
+                                let _ = tx
+                                    .send(Err(Status::invalid_argument("username is required")))
+                                    .await;
+                                continue;
+                            }
+
+                            let mut guard = users.lock().await;
+                            if guard.contains_key(&join_request.username) {
+                                let _ = tx
+                                    .send(Err(Status::already_exists("username already connected")))
+                                    .await;
+                                continue;
+                            }
+                            guard.insert(join_request.username.clone(), tx.clone());
+                            active_username = Some(join_request.username);
+
+                            let _ = tx
+                                .send(Ok(ServerMessage {
+                                    message_type: Some(server_message::MessageType::JoinResponse(
+                                        JoinResponse {
+                                            message: "joined".to_string(),
+                                            timestamp: None,
+                                        },
+                                    )),
+                                }))
+                                .await;
+                        }
+                        Some(client_message::MessageType::KeyExchangeMessage(message)) => {
+                            let target = message.receiver_id.clone();
+                            let server_message = ServerMessage {
+                                message_type: Some(server_message::MessageType::KeyExchange(
+                                    message,
+                                )),
+                            };
+                            let guard = users.lock().await;
+                            if let Some(peer_tx) = guard.get(&target) {
+                                let _ = peer_tx.send(Ok(server_message)).await;
+                            } else {
+                                let _ = tx.send(Ok(server_message)).await;
+                            }
+                        }
+                        Some(client_message::MessageType::EncryptedMessage(message)) => {
+                            let target = message.receiver_id.clone();
+                            let server_message = ServerMessage {
+                                message_type: Some(server_message::MessageType::Encrypted(message)),
+                            };
+                            let guard = users.lock().await;
+                            if let Some(peer_tx) = guard.get(&target) {
+                                let _ = peer_tx.send(Ok(server_message)).await;
+                            } else {
+                                let _ = tx.send(Ok(server_message)).await;
+                            }
+                        }
+                        None => {
+                            let _ = tx
+                                .send(Err(Status::invalid_argument("missing message type")))
+                                .await;
+                        }
+                    },
                     Err(status) => {
                         let _ = tx.send(Err(status)).await;
                         break;
                     }
                 }
+            }
+
+            if let Some(username) = active_username {
+                let mut guard = users.lock().await;
+                guard.remove(&username);
             }
         });
 
@@ -341,7 +409,10 @@ mod tests {
     async fn test_service() -> NewspeakService {
         let db = Connection::open(":memory:").await.unwrap();
         init_db(&db).await.unwrap();
-        NewspeakService { db: Arc::new(db) }
+        NewspeakService {
+            db: Arc::new(db),
+            users: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     #[tokio::test]
@@ -454,7 +525,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:10000".parse()?;
     let db = Connection::open("newspeak.db").await?;
     init_db(&db).await?;
-    let svc = NewspeakService { db: Arc::new(db) };
+    let svc = NewspeakService {
+        db: Arc::new(db),
+        users: Arc::new(Mutex::new(HashMap::new())),
+    };
 
     println!("NewspeakServer listening on {}", addr);
 
