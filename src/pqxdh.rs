@@ -10,38 +10,52 @@ use sha3::{
     Shake256,
     digest::{ExtendableOutput, Update},
 };
-use x25519_dalek as x25519;
+use x25519_dalek::{self as x25519, SharedSecret};
+
+type KemId = [u8; 16];
 
 pub struct KeyExchangeUser {
     pub identity_sk: ed25519::SigningKey,
     pub identity_pk: ed25519::VerifyingKey,
-
-    pub signed_prekey_sk: x25519::ReusableSecret,
     pub signed_prekey: SignedPrekey,
 
     pub last_resort_decap: DecapsulationKey<MlKem1024Params>,
     pub last_resort_pk: SignedMlKemPrekey,
+    pub last_resort_id: KemId,
 
-    pub one_time_keys: Vec<SignedPrekey>,
+    pub one_time_keys: KeyStore<u32, SignedPrekey>,
+    pub one_time_kem_keys: KeyStore<KemId, SignedMlKemPrekey>,
 }
 
 pub struct OneTimeKey<T> {
     key: T,
+    used: bool,
 }
 
-pub struct KeyStore<I: Hash, T> {
+pub struct KeyStore<I: Hash + Eq, T> {
     store: HashMap<I, OneTimeKey<T>>,
 }
 
-impl<I: Hash, T> KeyStore<I, T> {
+impl<I: Hash + Eq, T> KeyStore<I, T> {
     pub fn new() -> Self {
         Self {
             store: HashMap::new(),
         }
     }
+
+    pub fn get_id(&self, id: &I) -> Option<&OneTimeKey<T>> {
+        self.store.get(id)
+    }
+
+    pub fn mark_used(&mut self, id: &I) {
+        if let Some(val) = self.store.get_mut(&id) {
+            val.used = true;
+        }
+    }
 }
 
 pub struct SignedPrekey {
+    pub private_key: x25519::ReusableSecret,
     pub public_key: x25519::PublicKey,
     pub signature: ed25519::Signature,
 }
@@ -62,13 +76,21 @@ pub struct PQXDHInitMessage {
     peer_identity_public_key: ed25519::VerifyingKey,
     ephemeral_x25519_public_key: x25519::PublicKey,
     mlkem_ciphertext: Vec<u8>,
+    kem_used: KemId,
+    one_time_prekey_used: Option<u32>,
 }
 
 pub struct PrekeyBundle {
     signed_prekey: SignedPrekey,
     kem_prekey: SignedMlKemPrekey,
     identity_pk: ed25519::VerifyingKey,
-    one_time_pk: Option<SignedPrekey>,
+    one_time_prekey: Option<SignedPrekey>,
+    one_time_prekey_id: Option<u32>,
+    kem_id: KemId,
+}
+
+fn generate_kem_id() -> [u8; 16] {
+    rand::random()
 }
 
 impl KeyExchangeUser {
@@ -78,13 +100,13 @@ impl KeyExchangeUser {
         let mut identity_private_key = ed25519::SigningKey::generate(&mut rng);
         let identity_public_key = identity_private_key.verifying_key();
 
-        let x25519_private_key = x25519::ReusableSecret::random_from_rng(&mut rng);
-        let x25519_public_prekey = x25519::PublicKey::from(&x25519_private_key);
-        let x25519_public_prekey_signature =
-            identity_private_key.sign(x25519_public_prekey.as_bytes());
-        let x25519_prekey = SignedPrekey {
-            public_key: x25519_public_prekey,
-            signature: x25519_public_prekey_signature,
+        let signed_prekey_sk = x25519::ReusableSecret::random_from_rng(&mut rng);
+        let signed_prekey_pk = x25519::PublicKey::from(&signed_prekey_sk);
+        let signed_prekey_sig = identity_private_key.sign(signed_prekey_pk.as_bytes());
+        let signed_prekey = SignedPrekey {
+            private_key: signed_prekey_sk,
+            public_key: signed_prekey_pk,
+            signature: signed_prekey_sig,
         };
 
         let (mlkem1024_decap_key, mlkem1024_encap_key) = MlKem1024::generate(&mut rng);
@@ -98,11 +120,12 @@ impl KeyExchangeUser {
         return KeyExchangeUser {
             identity_sk: identity_private_key,
             identity_pk: identity_public_key,
-            signed_prekey_sk: x25519_private_key,
-            signed_prekey: x25519_prekey,
+            signed_prekey,
             last_resort_decap: mlkem1024_decap_key,
             last_resort_pk: mlkem1024_prekey,
-            one_time_keys: Vec::new(),
+            last_resort_id: generate_kem_id(),
+            one_time_keys: KeyStore::new(),
+            one_time_kem_keys: KeyStore::new(),
         };
     }
 
@@ -145,11 +168,20 @@ impl KeyExchangeUser {
         // DH3 = DH(EKA, SPKB)
         let dh_3 = ephemeral_sk.diffie_hellman(&other.signed_prekey.public_key);
 
-        // SK = KDF(DH1 || DH2 || DH3 || SS)
+        let mut dh_4: Option<[u8; 32]> = None;
+        if let Some(otpk) = other.one_time_prekey.as_ref() {
+            other
+                .identity_pk
+                .verify_strict(otpk.public_key.as_bytes(), &otpk.signature)
+                .with_context(|| "failed to verify one-time prekey")?;
+            dh_4 = Some(ephemeral_sk.diffie_hellman(&otpk.public_key).to_bytes());
+        }
+
         let secret_key = kdf(
             dh_1.as_bytes(),
             dh_2.as_bytes(),
             dh_3.as_bytes(),
+            dh_4.as_ref(),
             &mlkem_shared_secret,
         );
 
@@ -160,8 +192,11 @@ impl KeyExchangeUser {
         let init_message = PQXDHInitMessage {
             peer_identity_public_key: self.identity_pk,
             ephemeral_x25519_public_key: x25519::PublicKey::from(&ephemeral_sk),
-            mlkem_ciphertext: mlkem_ciphertext.to_vec(),
+            mlkem_ciphertext: mlkem_ciphertext.as_slice().to_vec(),
+            kem_used: other.kem_id,
+            one_time_prekey_used: other.one_time_prekey_id,
         };
+
         return Ok(PQXDHInitOutput {
             secret_key,
             message: init_message,
@@ -183,31 +218,53 @@ impl KeyExchangeUser {
 
         // DH1 = DH(IKA, SPKB)
         let dh_1 = self
-            .signed_prekey_sk
+            .signed_prekey
+            .private_key
             .diffie_hellman(&alice_identity_public_key_x25519);
         // DH2 = DH(EKA, IKB)
         let dh_2 =
             bob_identity_secret_key_x25519.diffie_hellman(&message.ephemeral_x25519_public_key);
         // DH3 = DH(EKA, SPKB)
         let dh_3 = self
-            .signed_prekey_sk
+            .signed_prekey
+            .private_key
             .diffie_hellman(&message.ephemeral_x25519_public_key);
+
+        let mut dh_4: Option<[u8; 32]> = None;
+        if let Some(otpk_id) = message.one_time_prekey_used {
+            match self.one_time_keys.get_id(&otpk_id) {
+                Some(skey) => {
+                    dh_4 = Some(
+                        skey.key
+                            .private_key
+                            .diffie_hellman(&message.ephemeral_x25519_public_key)
+                            .to_bytes(),
+                    )
+                }
+                None => {
+                    return Err(Error::msg(
+                        "cannot create shared secret due to missing one-time-key used.",
+                    ));
+                }
+            }
+        }
 
         // SK = KDF(DH1 || DH2 || DH3 || SS)
         let secret_key = kdf(
             dh_1.as_bytes(),
             dh_2.as_bytes(),
             dh_3.as_bytes(),
+            dh_4.as_ref(),
             &mlkem_shared_secret,
         );
 
-        // TODO: one time prekey
         return Ok(secret_key);
     }
 
     fn make_prekey(&self) -> PrekeyBundle {
         PrekeyBundle {
             signed_prekey: SignedPrekey {
+                private_key: self.signed_prekey.private_key.clone(),
                 public_key: self.signed_prekey.public_key,
                 signature: self.signed_prekey.signature,
             },
@@ -216,12 +273,20 @@ impl KeyExchangeUser {
                 signature: self.last_resort_pk.signature,
             },
             identity_pk: self.identity_pk,
-            one_time_pk: None,
+            one_time_prekey: None,
+            one_time_prekey_id: None,
+            kem_id: self.last_resort_id,
         }
     }
 }
 
-fn kdf(dh1: &[u8], dh2: &[u8], dh3: &[u8], mlkem_shared_secret: &[u8]) -> [u8; 32] {
+fn kdf(
+    dh1: &[u8],
+    dh2: &[u8],
+    dh3: &[u8],
+    dh4: Option<&[u8; 32]>,
+    mlkem_shared_secret: &[u8],
+) -> [u8; 32] {
     static KDF_INFO: &[u8] = b"PQXDH_CURVE25519_SHAKE256_ML-KEM-1024";
     let mut secret_key = [0u8; 32];
     let mut kdf = Shake256::default();
@@ -229,6 +294,9 @@ fn kdf(dh1: &[u8], dh2: &[u8], dh3: &[u8], mlkem_shared_secret: &[u8]) -> [u8; 3
     kdf.update(dh1);
     kdf.update(dh2);
     kdf.update(dh3);
+    if let Some(e) = dh4 {
+        kdf.update(e);
+    }
     kdf.update(mlkem_shared_secret);
     kdf.update(KDF_INFO);
     kdf.finalize_xof_into(&mut secret_key);

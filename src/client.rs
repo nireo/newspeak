@@ -4,7 +4,10 @@ pub mod newspeak {
 }
 
 use crate::{
-    newspeak::{KeyKind, RegisterRequest, newspeak_client::NewspeakClient},
+    newspeak::{
+        FetchPrekeyBundleRequest, FetchPrekeyBundleResponse, KeyKind, RegisterRequest,
+        newspeak_client::NewspeakClient,
+    },
     pqxdh::KeyExchangeUser,
 };
 use anyhow::{Ok, Result};
@@ -51,10 +54,21 @@ impl<'a> User<'a> {
             username: self.username.into(),
             identity_key: self.key_info.identity_pk.as_bytes().to_vec(),
             signed_prekey: Some((&self.key_info.signed_prekey).into()),
-            one_time_prekeys: self.key_info.one_time_keys.iter().map(Into::into).collect(),
+            one_time_prekeys: vec![],
         };
 
         self.client.register(req).await?;
+        Ok(())
+    }
+
+    pub async fn init_key_exchange(&mut self, other: String) -> Result<()> {
+        let prekey_bundle = self
+            .client
+            .fetch_prekey_bundle(FetchPrekeyBundleRequest { username: other })
+            .await?;
+
+        let lol = prekey_bundle.get_ref();
+
         Ok(())
     }
 }
