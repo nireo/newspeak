@@ -10,6 +10,7 @@ use newspeak::{
     FetchPrekeyBundleRequest, FetchPrekeyBundleResponse, PrekeyBundle, RegisterRequest,
     RegisterResponse, SignedPrekey,
 };
+use blake3;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_rusqlite::Connection;
@@ -24,6 +25,11 @@ use crate::newspeak::{ClientMessage, ServerMessage};
 #[derive(Clone)]
 struct NewspeakService {
     db: Arc<Connection>,
+}
+
+struct StoredPrekey {
+    id: i64,
+    prekey: SignedPrekey,
 }
 
 #[tonic::async_trait]
@@ -82,18 +88,28 @@ impl Newspeak for NewspeakService {
                         signed_prekey: Some(signed_prekey),
                         kem_encap_key: None,
                         one_time_prekey: None,
+                        kem_id: Vec::new(),
+                        one_time_prekey_id: None,
                     }));
                 }
 
+                let kem_encap_key = kem_encap_key.unwrap();
+                let kem_id = kem_id_from_key(&kem_encap_key.prekey.key);
                 let one_time_prekey = take_one_time_key(&tx, "one_time_prekeys", user_id)?;
+                let (one_time_prekey, one_time_prekey_id) = match one_time_prekey {
+                    Some(prekey) => (Some(prekey.prekey), Some(prekey.id as u32)),
+                    None => (None, None),
+                };
 
                 tx.commit()?;
 
                 Ok(Some(PrekeyBundle {
                     identity_key,
                     signed_prekey: Some(signed_prekey),
-                    kem_encap_key,
+                    kem_encap_key: Some(kem_encap_key.prekey),
                     one_time_prekey,
+                    kem_id,
+                    one_time_prekey_id,
                 }))
             })
             .await
@@ -217,7 +233,7 @@ fn take_one_time_key(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
     user_id: i64,
-) -> Result<Option<SignedPrekey>, RusqliteError> {
+) -> Result<Option<StoredPrekey>, RusqliteError> {
     let sql = format!(
         "SELECT id, kind, key, signature
         FROM {}
@@ -247,10 +263,14 @@ fn take_one_time_key(
     if let Some((id, prekey)) = row {
         let delete_sql = format!("DELETE FROM {} WHERE id = ?1", table);
         tx.execute(&delete_sql, params![id])?;
-        Ok(Some(prekey))
+        Ok(Some(StoredPrekey { id, prekey }))
     } else {
         Ok(None)
     }
+}
+
+fn kem_id_from_key(key: &[u8]) -> Vec<u8> {
+    blake3::hash(key).as_bytes()[..16].to_vec()
 }
 
 fn map_db_error(err: TokioRusqliteError<RusqliteError>) -> Status {

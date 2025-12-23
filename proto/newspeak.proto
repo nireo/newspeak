@@ -26,6 +26,8 @@ message PrekeyBundle {
   SignedPrekey signed_prekey = 2;
   SignedPrekey kem_encap_key = 3;
   optional SignedPrekey one_time_prekey = 4;
+  bytes kem_id = 5;
+  optional uint32 one_time_prekey_id = 6;
 }
 
 message FetchPrekeyBundleRequest {
@@ -61,7 +63,8 @@ message InitialMessage {
   bytes identity_key = 1;
   bytes ephemeral_key = 2;
   bytes kem_ciphertext = 3;
-  optional bytes one_time_prekey = 4;
+  optional uint32 one_time_prekey_id = 4;
+  bytes kem_id = 5;
 }
 
 message KeyExchangeMessage {

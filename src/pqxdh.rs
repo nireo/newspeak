@@ -78,6 +78,21 @@ pub struct SignedPrekey {
     pub signature: ed25519::Signature,
 }
 
+#[derive(Clone)]
+pub struct PublicSignedPrekey {
+    pub public_key: x25519::PublicKey,
+    pub signature: ed25519::Signature,
+}
+
+impl From<&SignedPrekey> for PublicSignedPrekey {
+    fn from(k: &SignedPrekey) -> Self {
+        PublicSignedPrekey {
+            public_key: k.public_key,
+            signature: k.signature,
+        }
+    }
+}
+
 impl SignedPrekey {
     pub fn new<R: Rng + CryptoRng>(rng: &mut R, identity_sk: &mut ed25519::SigningKey) -> Self {
         let private_key = x25519::ReusableSecret::random_from_rng(rng);
@@ -97,6 +112,21 @@ pub struct SignedMlKemPrekey {
     pub decap_key: DecapsulationKey<MlKem1024Params>,
     pub encap_key: EncapsulationKey<MlKem1024Params>,
     pub signature: ed25519::Signature,
+}
+
+#[derive(Clone)]
+pub struct PublicSignedMlKemPrekey {
+    pub encap_key: EncapsulationKey<MlKem1024Params>,
+    pub signature: ed25519::Signature,
+}
+
+impl From<&SignedMlKemPrekey> for PublicSignedMlKemPrekey {
+    fn from(k: &SignedMlKemPrekey) -> Self {
+        PublicSignedMlKemPrekey {
+            encap_key: k.encap_key.clone(),
+            signature: k.signature,
+        }
+    }
 }
 
 impl SignedMlKemPrekey {
@@ -128,10 +158,10 @@ pub struct PQXDHInitMessage {
 }
 
 pub struct PrekeyBundle {
-    signed_prekey: SignedPrekey,
-    kem_prekey: SignedMlKemPrekey,
+    signed_prekey: PublicSignedPrekey,
+    kem_prekey: PublicSignedMlKemPrekey,
     identity_pk: ed25519::VerifyingKey,
-    one_time_prekey: Option<SignedPrekey>,
+    one_time_prekey: Option<PublicSignedPrekey>,
     one_time_prekey_id: Option<u32>,
     kem_id: KemId,
 }
@@ -318,16 +348,8 @@ impl KeyExchangeUser {
     fn make_prekey(&self) -> PrekeyBundle {
         let one_time_prekey = self.one_time_keys.first_unused();
         let mut bundle = PrekeyBundle {
-            signed_prekey: SignedPrekey {
-                private_key: self.signed_prekey.private_key.clone(),
-                public_key: self.signed_prekey.public_key,
-                signature: self.signed_prekey.signature,
-            },
-            kem_prekey: SignedMlKemPrekey {
-                decap_key: self.last_resort_kem.decap_key.clone(),
-                encap_key: self.last_resort_kem.encap_key.clone(),
-                signature: self.last_resort_kem.signature,
-            },
+            signed_prekey: PublicSignedPrekey::from(&self.signed_prekey),
+            kem_prekey: PublicSignedMlKemPrekey::from(&self.last_resort_kem),
             identity_pk: self.identity_pk,
             one_time_prekey: None,
             one_time_prekey_id: None,
@@ -336,10 +358,62 @@ impl KeyExchangeUser {
 
         if let Some(signed_prekey) = one_time_prekey {
             bundle.one_time_prekey_id = Some(signed_prekey.0.clone());
-            bundle.one_time_prekey = Some(signed_prekey.1.key.clone());
+            bundle.one_time_prekey = Some(PublicSignedPrekey::from(&signed_prekey.1.key));
         }
 
         bundle
+    }
+}
+
+impl PrekeyBundle {
+    pub fn new(
+        signed_prekey: PublicSignedPrekey,
+        kem_prekey: PublicSignedMlKemPrekey,
+        identity_pk: ed25519::VerifyingKey,
+        one_time_prekey: Option<PublicSignedPrekey>,
+        one_time_prekey_id: Option<u32>,
+        kem_id: KemId,
+    ) -> Self {
+        PrekeyBundle {
+            signed_prekey,
+            kem_prekey,
+            identity_pk,
+            one_time_prekey,
+            one_time_prekey_id,
+            kem_id,
+        }
+    }
+}
+
+impl PQXDHInitOutput {
+    pub fn secret_key(&self) -> &[u8; 32] {
+        &self.secret_key
+    }
+
+    pub fn message(&self) -> &PQXDHInitMessage {
+        &self.message
+    }
+}
+
+impl PQXDHInitMessage {
+    pub fn peer_identity_public_key(&self) -> &ed25519::VerifyingKey {
+        &self.peer_identity_public_key
+    }
+
+    pub fn ephemeral_x25519_public_key(&self) -> &x25519::PublicKey {
+        &self.ephemeral_x25519_public_key
+    }
+
+    pub fn mlkem_ciphertext(&self) -> &[u8] {
+        &self.mlkem_ciphertext
+    }
+
+    pub fn kem_used(&self) -> &KemId {
+        &self.kem_used
+    }
+
+    pub fn one_time_prekey_used(&self) -> Option<u32> {
+        self.one_time_prekey_used
     }
 }
 
