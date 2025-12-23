@@ -6,6 +6,7 @@ use ml_kem::{
     EncodedSizeUser, KemCore, MlKem1024, MlKem1024Params,
     kem::{Decapsulate, DecapsulationKey, Encapsulate, EncapsulationKey},
 };
+use rand::{CryptoRng, Rng};
 use sha3::{
     Shake256,
     digest::{ExtendableOutput, Update},
@@ -19,24 +20,26 @@ pub struct KeyExchangeUser {
     pub identity_pk: ed25519::VerifyingKey,
     pub signed_prekey: SignedPrekey,
 
-    pub last_resort_decap: DecapsulationKey<MlKem1024Params>,
-    pub last_resort_pk: SignedMlKemPrekey,
+    pub last_resort_kem: SignedMlKemPrekey,
     pub last_resort_id: KemId,
 
     pub one_time_keys: KeyStore<u32, SignedPrekey>,
     pub one_time_kem_keys: KeyStore<KemId, SignedMlKemPrekey>,
+
+    pub one_time_prekey_id: u32,
 }
 
-pub struct OneTimeKey<T> {
+#[derive(Clone)]
+pub struct OneTimeKey<T: Clone> {
     key: T,
     used: bool,
 }
 
-pub struct KeyStore<I: Hash + Eq, T> {
+pub struct KeyStore<I: Hash + Eq, T: Clone> {
     store: HashMap<I, OneTimeKey<T>>,
 }
 
-impl<I: Hash + Eq, T> KeyStore<I, T> {
+impl<I: Hash + Eq, T: Clone> KeyStore<I, T> {
     pub fn new() -> Self {
         Self {
             store: HashMap::new(),
@@ -52,17 +55,61 @@ impl<I: Hash + Eq, T> KeyStore<I, T> {
             val.used = true;
         }
     }
+
+    pub fn insert(&mut self, id: I, key: T) {
+        self.store.insert(
+            id,
+            OneTimeKey {
+                key: key,
+                used: false,
+            },
+        );
+    }
+
+    pub fn first_unused(&self) -> Option<(&I, &OneTimeKey<T>)> {
+        self.store.iter().find(|k| !k.1.used)
+    }
 }
 
+#[derive(Clone)]
 pub struct SignedPrekey {
     pub private_key: x25519::ReusableSecret,
     pub public_key: x25519::PublicKey,
     pub signature: ed25519::Signature,
 }
 
+impl SignedPrekey {
+    pub fn new<R: Rng + CryptoRng>(rng: &mut R, identity_sk: &mut ed25519::SigningKey) -> Self {
+        let private_key = x25519::ReusableSecret::random_from_rng(rng);
+        let public_key = x25519::PublicKey::from(&private_key);
+        let signature = identity_sk.sign(public_key.as_bytes());
+
+        SignedPrekey {
+            private_key,
+            public_key,
+            signature,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct SignedMlKemPrekey {
+    pub decap_key: DecapsulationKey<MlKem1024Params>,
     pub encap_key: EncapsulationKey<MlKem1024Params>,
     pub signature: ed25519::Signature,
+}
+
+impl SignedMlKemPrekey {
+    pub fn new<R: Rng + CryptoRng>(rng: &mut R, identity_sk: &mut ed25519::SigningKey) -> Self {
+        let (mlkem1024_decap_key, mlkem1024_encap_key) = MlKem1024::generate(rng);
+        let mlkem1024_encap_key_signautre = identity_sk.sign(&mlkem1024_encap_key.as_bytes());
+
+        SignedMlKemPrekey {
+            encap_key: mlkem1024_encap_key,
+            decap_key: mlkem1024_decap_key,
+            signature: mlkem1024_encap_key_signautre,
+        }
+    }
 }
 
 pub struct PQXDHInitOutput {
@@ -99,37 +146,47 @@ impl KeyExchangeUser {
 
         let mut identity_private_key = ed25519::SigningKey::generate(&mut rng);
         let identity_public_key = identity_private_key.verifying_key();
+        let signed_prekey = SignedPrekey::new(&mut rng, &mut identity_private_key);
+        let last_resort_kem = SignedMlKemPrekey::new(&mut rng, &mut identity_private_key);
 
-        let signed_prekey_sk = x25519::ReusableSecret::random_from_rng(&mut rng);
-        let signed_prekey_pk = x25519::PublicKey::from(&signed_prekey_sk);
-        let signed_prekey_sig = identity_private_key.sign(signed_prekey_pk.as_bytes());
-        let signed_prekey = SignedPrekey {
-            private_key: signed_prekey_sk,
-            public_key: signed_prekey_pk,
-            signature: signed_prekey_sig,
-        };
-
-        let (mlkem1024_decap_key, mlkem1024_encap_key) = MlKem1024::generate(&mut rng);
-        let mlkem1024_encap_key_signautre =
-            identity_private_key.sign(&mlkem1024_encap_key.as_bytes());
-        let mlkem1024_prekey = SignedMlKemPrekey {
-            encap_key: mlkem1024_encap_key,
-            signature: mlkem1024_encap_key_signautre,
-        };
-
-        return KeyExchangeUser {
+        let mut u = KeyExchangeUser {
             identity_sk: identity_private_key,
             identity_pk: identity_public_key,
             signed_prekey,
-            last_resort_decap: mlkem1024_decap_key,
-            last_resort_pk: mlkem1024_prekey,
+            last_resort_kem,
             last_resort_id: generate_kem_id(),
             one_time_keys: KeyStore::new(),
             one_time_kem_keys: KeyStore::new(),
+            one_time_prekey_id: 0,
         };
+
+        u.add_one_time_prekeys(10);
+        u.add_one_time_kem_keys(10);
+
+        u
     }
 
-    fn init_key_exchange(&self, other: &PrekeyBundle) -> Result<PQXDHInitOutput, Error> {
+    fn add_one_time_prekeys(&mut self, count: usize) {
+        let mut rng = rand::thread_rng();
+        for _ in 0..count {
+            let signed_prekey = SignedPrekey::new(&mut rng, &mut self.identity_sk);
+            self.one_time_keys
+                .insert(self.one_time_prekey_id, signed_prekey);
+            self.one_time_prekey_id += 1;
+        }
+    }
+
+    fn add_one_time_kem_keys(&mut self, count: usize) {
+        let mut rng = rand::thread_rng(); // Init once
+        for _ in 0..count {
+            let id: KemId = generate_kem_id();
+            let signed_prekey = SignedMlKemPrekey::new(&mut rng, &mut self.identity_sk);
+
+            self.one_time_kem_keys.insert(id, signed_prekey);
+        }
+    }
+
+    pub fn init_key_exchange(&self, other: &PrekeyBundle) -> Result<PQXDHInitOutput, Error> {
         let mut rng = rand::thread_rng();
 
         other
@@ -185,10 +242,6 @@ impl KeyExchangeUser {
             &mlkem_shared_secret,
         );
 
-        // if a one-time prekey was available, do this instead
-        // DH4 = DH(EKA, OPKB)
-        // SK = KDF(DH1 || DH2 || DH3 || DH4 || SS)
-
         let init_message = PQXDHInitMessage {
             peer_identity_public_key: self.identity_pk,
             ephemeral_x25519_public_key: x25519::PublicKey::from(&ephemeral_sk),
@@ -203,12 +256,13 @@ impl KeyExchangeUser {
         });
     }
 
-    fn receive_key_exchange(
+    pub fn receive_key_exchange(
         self: &KeyExchangeUser,
         message: &PQXDHInitMessage,
     ) -> Result<[u8; 32], Error> {
         let mlkem_shared_secret = self
-            .last_resort_decap
+            .last_resort_kem
+            .decap_key
             .decapsulate(message.mlkem_ciphertext.as_slice().try_into().unwrap())
             .map_err(|_| Error::msg("failed to decapsulate with ML-KEM-1024"))?;
 
@@ -262,21 +316,30 @@ impl KeyExchangeUser {
     }
 
     fn make_prekey(&self) -> PrekeyBundle {
-        PrekeyBundle {
+        let one_time_prekey = self.one_time_keys.first_unused();
+        let mut bundle = PrekeyBundle {
             signed_prekey: SignedPrekey {
                 private_key: self.signed_prekey.private_key.clone(),
                 public_key: self.signed_prekey.public_key,
                 signature: self.signed_prekey.signature,
             },
             kem_prekey: SignedMlKemPrekey {
-                encap_key: self.last_resort_pk.encap_key.clone(),
-                signature: self.last_resort_pk.signature,
+                decap_key: self.last_resort_kem.decap_key.clone(),
+                encap_key: self.last_resort_kem.encap_key.clone(),
+                signature: self.last_resort_kem.signature,
             },
             identity_pk: self.identity_pk,
             one_time_prekey: None,
             one_time_prekey_id: None,
             kem_id: self.last_resort_id,
+        };
+
+        if let Some(signed_prekey) = one_time_prekey {
+            bundle.one_time_prekey_id = Some(signed_prekey.0.clone());
+            bundle.one_time_prekey = Some(signed_prekey.1.key.clone());
         }
+
+        bundle
     }
 }
 
