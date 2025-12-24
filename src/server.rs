@@ -1,6 +1,3 @@
-mod pqxdh;
-mod ratchet;
-
 pub mod newspeak {
     tonic::include_proto!("newspeak");
 }
@@ -54,9 +51,16 @@ impl Newspeak for NewspeakService {
             .call(move |conn| {
                 let tx = conn.transaction()?;
 
-                let user_row: Option<(i64, Vec<u8>, SignedPrekey)> = tx
+                let user_row: Option<(i64, Vec<u8>, SignedPrekey, SignedPrekey)> = tx
                     .query_row(
-                        "SELECT id, identity_key, signed_prekey_kind, signed_prekey_key, signed_prekey_signature
+                        "SELECT id,
+                                identity_key,
+                                signed_prekey_kind,
+                                signed_prekey_key,
+                                signed_prekey_signature,
+                                kem_prekey_kind,
+                                kem_prekey_key,
+                                kem_prekey_signature
                         FROM users
                         WHERE username = ?1",
                         params![username],
@@ -66,6 +70,9 @@ impl Newspeak for NewspeakService {
                             let signed_prekey_kind: i32 = row.get(2)?;
                             let signed_prekey_key: Vec<u8> = row.get(3)?;
                             let signed_prekey_signature: Vec<u8> = row.get(4)?;
+                            let kem_prekey_kind: i32 = row.get(5)?;
+                            let kem_prekey_key: Vec<u8> = row.get(6)?;
+                            let kem_prekey_signature: Vec<u8> = row.get(7)?;
                             Ok((
                                 user_id,
                                 identity_key,
@@ -74,30 +81,31 @@ impl Newspeak for NewspeakService {
                                     key: signed_prekey_key,
                                     signature: signed_prekey_signature,
                                 },
+                                SignedPrekey {
+                                    kind: kem_prekey_kind,
+                                    key: kem_prekey_key,
+                                    signature: kem_prekey_signature,
+                                },
                             ))
                         },
                     )
                     .optional()?;
 
-                let Some((user_id, identity_key, signed_prekey)) = user_row else {
+                let Some((user_id, identity_key, signed_prekey, kem_prekey)) = user_row else {
                     return Ok(None);
                 };
 
                 let kem_encap_key = take_one_time_key(&tx, "one_time_kem_keys", user_id)?;
-                if kem_encap_key.is_none() {
-                    tx.commit()?;
-                    return Ok(Some(PrekeyBundle {
-                        identity_key,
-                        signed_prekey: Some(signed_prekey),
-                        kem_encap_key: None,
-                        one_time_prekey: None,
-                        kem_id: Vec::new(),
-                        one_time_prekey_id: None,
-                    }));
-                }
-
-                let kem_encap_key = kem_encap_key.unwrap();
-                let kem_id = kem_id_from_key(&kem_encap_key.prekey.key);
+                let (kem_encap_key, kem_id) = match kem_encap_key {
+                    Some(prekey) => {
+                        let kem_id = kem_id_from_key(&prekey.prekey.key);
+                        (prekey.prekey, kem_id)
+                    }
+                    None => {
+                        let kem_id = kem_id_from_key(&kem_prekey.key);
+                        (kem_prekey, kem_id)
+                    }
+                };
                 let one_time_prekey = take_one_time_key(&tx, "one_time_prekeys", user_id)?;
                 let (one_time_prekey, one_time_prekey_id) = match one_time_prekey {
                     Some(prekey) => (Some(prekey.prekey), Some(prekey.id as u32)),
@@ -109,7 +117,7 @@ impl Newspeak for NewspeakService {
                 Ok(Some(PrekeyBundle {
                     identity_key,
                     signed_prekey: Some(signed_prekey),
-                    kem_encap_key: Some(kem_encap_key.prekey),
+                    kem_encap_key: Some(kem_encap_key),
                     one_time_prekey,
                     kem_id,
                     one_time_prekey_id,
@@ -119,9 +127,6 @@ impl Newspeak for NewspeakService {
             .map_err(map_db_error)?;
 
         let bundle = bundle.ok_or_else(|| Status::not_found("username not registered"))?;
-        if bundle.kem_encap_key.is_none() {
-            return Err(Status::failed_precondition("kem prekey unavailable"));
-        }
 
         let reply = FetchPrekeyBundleResponse {
             bundle: Some(bundle),
@@ -230,6 +235,9 @@ impl Newspeak for NewspeakService {
         let signed_prekey = request
             .signed_prekey
             .ok_or_else(|| Status::invalid_argument("signed_prekey is required"))?;
+        let kem_prekey = request
+            .kem_prekey
+            .ok_or_else(|| Status::invalid_argument("kem_prekey is required"))?;
 
         let username = request.username;
         let identity_key = request.identity_key;
@@ -244,14 +252,20 @@ impl Newspeak for NewspeakService {
                     identity_key,
                     signed_prekey_kind,
                     signed_prekey_key,
-                    signed_prekey_signature
-                ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    signed_prekey_signature,
+                    kem_prekey_kind,
+                    kem_prekey_key,
+                    kem_prekey_signature
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     username,
                     identity_key,
                     signed_prekey.kind,
                     signed_prekey.key,
-                    signed_prekey.signature
+                    signed_prekey.signature,
+                    kem_prekey.kind,
+                    kem_prekey.key,
+                    kem_prekey.signature
                 ],
             )?;
 
@@ -365,6 +379,9 @@ async fn init_db(conn: &Connection) -> Result<(), TokioRusqliteError<RusqliteErr
                 signed_prekey_kind INTEGER NOT NULL,
                 signed_prekey_key BLOB NOT NULL,
                 signed_prekey_signature BLOB NOT NULL,
+                kem_prekey_kind INTEGER NOT NULL,
+                kem_prekey_key BLOB NOT NULL,
+                kem_prekey_signature BLOB NOT NULL,
                 signed_prekey_created_at INTEGER
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username);
@@ -423,6 +440,7 @@ mod tests {
             identity_key: vec![1, 2, 3],
             signed_prekey: Some(sample_prekey(KeyKind::X25519, &[4, 5], &[6])),
             one_time_prekeys: vec![sample_prekey(KeyKind::X25519, &[7], &[8])],
+            kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[9], &[10])),
         };
 
         let response = svc.register(Request::new(request)).await.unwrap();
@@ -453,6 +471,7 @@ mod tests {
             identity_key: vec![11, 12],
             signed_prekey: Some(sample_prekey(KeyKind::X25519, &[13], &[14])),
             one_time_prekeys: vec![],
+            kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[15], &[16])),
         };
 
         svc.register(Request::new(request.clone())).await.unwrap();
@@ -468,11 +487,12 @@ mod tests {
             identity_key: vec![1],
             signed_prekey: Some(sample_prekey(KeyKind::X25519, &[2], &[3])),
             one_time_prekeys: vec![sample_prekey(KeyKind::X25519, &[4], &[5])],
+            kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[6], &[7])),
         };
 
         svc.register(Request::new(request)).await.unwrap();
 
-        let kem_prekey = sample_prekey(KeyKind::MlKem1024, &[6], &[7]);
+        let kem_prekey = sample_prekey(KeyKind::MlKem1024, &[8], &[9]);
         svc.db
             .call(move |conn| {
                 let tx = conn.transaction()?;
@@ -494,10 +514,11 @@ mod tests {
             }))
             .await
             .unwrap();
+
         let bundle = response.into_inner().bundle.unwrap();
         assert_eq!(bundle.identity_key, vec![1]);
         assert_eq!(bundle.signed_prekey.unwrap().key, vec![2]);
-        assert_eq!(bundle.kem_encap_key.unwrap().key, vec![6]);
+        assert_eq!(bundle.kem_encap_key.unwrap().key, vec![8]);
         assert_eq!(bundle.one_time_prekey.unwrap().key, vec![4]);
 
         let counts = svc

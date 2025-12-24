@@ -43,6 +43,7 @@ message RegisterRequest {
   bytes identity_key = 2;
   SignedPrekey signed_prekey = 3;
   repeated SignedPrekey one_time_prekeys = 4;
+  SignedPrekey kem_prekey = 5;
 }
 
 message RegisterResponse {

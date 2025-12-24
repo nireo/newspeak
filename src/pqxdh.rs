@@ -11,7 +11,7 @@ use sha3::{
     Shake256,
     digest::{ExtendableOutput, Update},
 };
-use x25519_dalek::{self as x25519, SharedSecret};
+use x25519_dalek::{self as x25519};
 
 type KemId = [u8; 16];
 
@@ -73,7 +73,7 @@ impl<I: Hash + Eq, T: Clone> KeyStore<I, T> {
 
 #[derive(Clone)]
 pub struct SignedPrekey {
-    pub private_key: x25519::ReusableSecret,
+    pub private_key: x25519::StaticSecret,
     pub public_key: x25519::PublicKey,
     pub signature: ed25519::Signature,
 }
@@ -95,7 +95,7 @@ impl From<&SignedPrekey> for PublicSignedPrekey {
 
 impl SignedPrekey {
     pub fn new<R: Rng + CryptoRng>(rng: &mut R, identity_sk: &mut ed25519::SigningKey) -> Self {
-        let private_key = x25519::ReusableSecret::random_from_rng(rng);
+        let private_key = x25519::StaticSecret::random_from_rng(rng);
         let public_key = x25519::PublicKey::from(&private_key);
         let signature = identity_sk.sign(public_key.as_bytes());
 
@@ -143,27 +143,27 @@ impl SignedMlKemPrekey {
 }
 
 pub struct PQXDHInitOutput {
-    secret_key: [u8; 32],
+    pub secret_key: [u8; 32],
 
     // The message here is public information as is to be shared.
-    message: PQXDHInitMessage,
+    pub message: PQXDHInitMessage,
 }
 
 pub struct PQXDHInitMessage {
-    peer_identity_public_key: ed25519::VerifyingKey,
-    ephemeral_x25519_public_key: x25519::PublicKey,
-    mlkem_ciphertext: Vec<u8>,
-    kem_used: KemId,
-    one_time_prekey_used: Option<u32>,
+    pub peer_identity_public_key: ed25519::VerifyingKey,
+    pub ephemeral_x25519_public_key: x25519::PublicKey,
+    pub mlkem_ciphertext: Vec<u8>,
+    pub kem_used: KemId,
+    pub one_time_prekey_used: Option<u32>,
 }
 
 pub struct PrekeyBundle {
-    signed_prekey: PublicSignedPrekey,
-    kem_prekey: PublicSignedMlKemPrekey,
-    identity_pk: ed25519::VerifyingKey,
-    one_time_prekey: Option<PublicSignedPrekey>,
-    one_time_prekey_id: Option<u32>,
-    kem_id: KemId,
+    pub signed_prekey: PublicSignedPrekey,
+    pub kem_prekey: PublicSignedMlKemPrekey,
+    pub identity_pk: ed25519::VerifyingKey,
+    pub one_time_prekey: Option<PublicSignedPrekey>,
+    pub one_time_prekey_id: Option<u32>,
+    pub kem_id: KemId,
 }
 
 fn generate_kem_id() -> [u8; 16] {
@@ -382,38 +382,6 @@ impl PrekeyBundle {
             one_time_prekey_id,
             kem_id,
         }
-    }
-}
-
-impl PQXDHInitOutput {
-    pub fn secret_key(&self) -> &[u8; 32] {
-        &self.secret_key
-    }
-
-    pub fn message(&self) -> &PQXDHInitMessage {
-        &self.message
-    }
-}
-
-impl PQXDHInitMessage {
-    pub fn peer_identity_public_key(&self) -> &ed25519::VerifyingKey {
-        &self.peer_identity_public_key
-    }
-
-    pub fn ephemeral_x25519_public_key(&self) -> &x25519::PublicKey {
-        &self.ephemeral_x25519_public_key
-    }
-
-    pub fn mlkem_ciphertext(&self) -> &[u8] {
-        &self.mlkem_ciphertext
-    }
-
-    pub fn kem_used(&self) -> &KemId {
-        &self.kem_used
-    }
-
-    pub fn one_time_prekey_used(&self) -> Option<u32> {
-        self.one_time_prekey_used
     }
 }
 

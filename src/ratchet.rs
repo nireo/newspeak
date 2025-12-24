@@ -1,4 +1,3 @@
-use crate::pqxdh::*;
 use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit,
     aead::{AeadMut, Payload},
@@ -7,26 +6,26 @@ use x25519_dalek as ecdh;
 use x25519_dalek as x25519;
 
 pub struct RatchetState {
-    sending_sk: ecdh::StaticSecret,
-    sending_pk: ecdh::PublicKey,
-    receiving_pk: Option<ecdh::PublicKey>,
-    receiving_counter: u64,
-    sending_counter: u64,
+    pub sending_sk: ecdh::StaticSecret,
+    pub sending_pk: ecdh::PublicKey,
+    pub receiving_pk: Option<ecdh::PublicKey>,
+    pub receiving_counter: u64,
+    pub sending_counter: u64,
 
-    root_key: [u8; 32],
-    chain_key_sending: [u8; 32],
-    chain_key_receiving: [u8; 32],
+    pub root_key: [u8; 32],
+    pub chain_key_sending: [u8; 32],
+    pub chain_key_receiving: [u8; 32],
 }
 
 pub struct RatchetMessageHeader {
-    pk: ecdh::PublicKey,
-    counter: u64,
-    nonce: [u8; 12],
+    pub pk: ecdh::PublicKey,
+    pub counter: u64,
+    pub nonce: [u8; 12],
 }
 
 pub struct RatchetMessage {
-    header: RatchetMessageHeader,
-    ciphertext: Vec<u8>,
+    pub header: RatchetMessageHeader,
+    pub ciphertext: Vec<u8>,
 }
 
 impl RatchetState {
@@ -89,10 +88,7 @@ impl RatchetState {
             )
             .unwrap();
 
-        println!("> sending [{}]: {message}", self.sending_counter);
-
         let message = RatchetMessage { header, ciphertext };
-
         self.sending_counter += 1;
 
         return message;

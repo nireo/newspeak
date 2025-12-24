@@ -1,28 +1,36 @@
+pub mod local_store;
 pub mod pqxdh;
+pub mod ratchet;
 pub mod newspeak {
     tonic::include_proto!("newspeak");
 }
 
 use crate::{
+    local_store::LocalStorage,
     newspeak::{
-        ClientMessage, EncryptedMessage, FetchPrekeyBundleRequest, JoinRequest, KeyKind,
-        RatchetMessage, RegisterRequest, ServerMessage, client_message,
-        newspeak_client::NewspeakClient, server_message,
+        ClientMessage, EncryptedMessage, FetchPrekeyBundleRequest, InitialMessage, JoinRequest,
+        KeyKind, RatchetMessage as ProtoRatchetMessage, RegisterRequest, ServerMessage,
+        client_message, newspeak_client::NewspeakClient, server_message,
     },
-    pqxdh::{KeyExchangeUser, PrekeyBundle, PublicSignedMlKemPrekey, PublicSignedPrekey},
+    pqxdh::{
+        KeyExchangeUser, PQXDHInitMessage, PrekeyBundle, PublicSignedMlKemPrekey,
+        PublicSignedPrekey,
+    },
+    ratchet::{RatchetMessage, RatchetState},
 };
 use anyhow::{Result, anyhow};
 use ed25519_dalek as ed25519;
 use ml_kem::{Encoded, EncodedSizeUser, MlKem1024Params, kem::EncapsulationKey};
+use std::sync::Arc;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use x25519_dalek as x25519;
 
 struct User<'a> {
     username: &'a str,
-    key_info: KeyExchangeUser,
+    key_info: Arc<Mutex<KeyExchangeUser>>,
     client: NewspeakClient<Channel>,
 }
 
@@ -47,27 +55,36 @@ impl From<&pqxdh::SignedMlKemPrekey> for newspeak::SignedPrekey {
 }
 
 impl<'a> User<'a> {
-    pub fn new(username: &'a str, client: NewspeakClient<Channel>) -> Self {
+    pub fn new(
+        username: &'a str,
+        client: NewspeakClient<Channel>,
+        key_info: KeyExchangeUser,
+    ) -> Self {
         User {
             username,
-            key_info: pqxdh::KeyExchangeUser::new(),
+            key_info: Arc::new(Mutex::new(key_info)),
             client,
         }
     }
 
     pub async fn register(&mut self) -> Result<()> {
+        let key_info = self.key_info.lock().await;
         let req = RegisterRequest {
             username: self.username.into(),
-            identity_key: self.key_info.identity_pk.as_bytes().to_vec(),
-            signed_prekey: Some((&self.key_info.signed_prekey).into()),
+            identity_key: key_info.identity_pk.as_bytes().to_vec(),
+            signed_prekey: Some((&key_info.signed_prekey).into()),
             one_time_prekeys: vec![],
+            kem_prekey: Some((&key_info.last_resort_kem).into()),
         };
 
         self.client.register(req).await?;
         Ok(())
     }
 
-    pub async fn init_key_exchange(&mut self, other: String) -> Result<()> {
+    pub async fn create_key_exchange_message(
+        &mut self,
+        other: String,
+    ) -> Result<(newspeak::KeyExchangeMessage, RatchetState)> {
         let receiver_id = other.clone();
         let response = self
             .client
@@ -79,28 +96,33 @@ impl<'a> User<'a> {
             .bundle
             .ok_or_else(|| anyhow!("missing prekey bundle in response"))?;
         let prekey_bundle = pqxdh_prekey_bundle_from_proto(&bundle)?;
-        let init_output = self.key_info.init_key_exchange(&prekey_bundle)?;
-        let init_message = init_output.message();
+        let key_info = self.key_info.lock().await;
+        let init_output = key_info.init_key_exchange(&prekey_bundle)?;
+        let init_message = init_output.message;
+
+        let mut ratchet_state = RatchetState::new();
+        ratchet_state.as_initiator(
+            init_output.secret_key.clone(),
+            prekey_bundle.signed_prekey.public_key.clone(),
+        );
 
         let initial_message = newspeak::InitialMessage {
-            identity_key: init_message.peer_identity_public_key().as_bytes().to_vec(),
-            ephemeral_key: init_message
-                .ephemeral_x25519_public_key()
-                .as_bytes()
-                .to_vec(),
-            kem_ciphertext: init_message.mlkem_ciphertext().to_vec(),
-            one_time_prekey_id: init_message.one_time_prekey_used(),
-            kem_id: init_message.kem_used().to_vec(),
+            identity_key: init_message.peer_identity_public_key.as_bytes().to_vec(),
+            ephemeral_key: init_message.ephemeral_x25519_public_key.as_bytes().to_vec(),
+            kem_ciphertext: init_message.mlkem_ciphertext.to_vec(),
+            one_time_prekey_id: init_message.one_time_prekey_used,
+            kem_id: init_message.kem_used.to_vec(),
         };
 
-        let _key_exchange_message = newspeak::KeyExchangeMessage {
-            sender_id: self.username.to_string(),
-            receiver_id,
-            initial_message: Some(initial_message),
-            timestamp: None,
-        };
-
-        Ok(())
+        Ok((
+            newspeak::KeyExchangeMessage {
+                sender_id: self.username.to_string(),
+                receiver_id,
+                initial_message: Some(initial_message),
+                timestamp: None,
+            },
+            ratchet_state,
+        ))
     }
 }
 
@@ -209,37 +231,67 @@ fn format_server_message(message: ServerMessage) -> String {
         Some(server_message::MessageType::JoinResponse(join)) => {
             format!("server: {}", join.message)
         }
-        Some(server_message::MessageType::KeyExchange(message)) => {
-            format!(
-                "key exchange from {} to {}",
-                message.sender_id, message.receiver_id
-            )
-        }
-        Some(server_message::MessageType::Encrypted(message)) => {
-            let ratchet = message.ratchet_message.unwrap_or_default();
-            let text = String::from_utf8_lossy(&ratchet.ciphertext);
-            format!("message from {}: {}", message.sender_id, text)
-        }
-        None => "server: empty message".to_string(),
+        _ => "server: event".to_string(),
     }
 }
 
-fn make_dummy_ratchet_message(payload: Vec<u8>, counter: i32) -> RatchetMessage {
-    RatchetMessage {
-        public_key: Vec::new(),
+fn ratchet_message_to_proto(message: RatchetMessage) -> ProtoRatchetMessage {
+    ProtoRatchetMessage {
+        public_key: message.header.pk.as_bytes().to_vec(),
         previous_chain_length: 0,
-        message_number: counter,
-        ciphertext: payload,
-        nonce: Vec::new(),
+        message_number: message.header.counter as i32,
+        ciphertext: message.ciphertext,
+        nonce: message.header.nonce.to_vec(),
     }
 }
+
+fn ratchet_message_from_proto(message: ProtoRatchetMessage) -> Result<RatchetMessage> {
+    let pk = parse_x25519_public_key(&message.public_key)?;
+    if message.message_number < 0 {
+        return Err(anyhow!("invalid ratchet message counter"));
+    }
+
+    let nonce: [u8; 12] = message
+        .nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("invalid ratchet nonce length: {}", message.nonce.len()))?;
+
+    Ok(RatchetMessage {
+        header: ratchet::RatchetMessageHeader {
+            pk,
+            counter: message.message_number as u64,
+            nonce,
+        },
+        ciphertext: message.ciphertext,
+    })
+}
+
+fn pqxdh_init_from_proto(message: &InitialMessage) -> Result<PQXDHInitMessage> {
+    Ok(PQXDHInitMessage {
+        peer_identity_public_key: parse_ed25519_public_key(&message.identity_key)?,
+        ephemeral_x25519_public_key: parse_x25519_public_key(&message.ephemeral_key)?,
+        mlkem_ciphertext: message.kem_ciphertext.clone(),
+        kem_used: parse_kem_id(&message.kem_id)?,
+        one_time_prekey_used: message.one_time_prekey_id,
+    })
+}
+
+const RATCHET_AD: &[u8] = b"ratchet-ad";
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let client = NewspeakClient::connect("http://[::1]:10000").await?;
 
-    let mut user = User::new(&args[1], client);
+    if args.len() < 3 {
+        println!("usage: newspeak <you> <username>");
+        std::process::exit(1);
+    }
+
+    let storage = LocalStorage::new().await?;
+    let key_info = storage.load_or_create_user(&args[1]).await?;
+    let mut user = User::new(&args[1], client, key_info);
     let receiver = args.get(2).cloned().unwrap_or_else(|| args[1].clone());
 
     println!("logged in as: {}", user.username);
@@ -268,14 +320,77 @@ async fn main() -> Result<()> {
     })
     .await?;
 
+    let ratchet_state = Arc::new(Mutex::new(None));
+    let key_info = Arc::clone(&user.key_info);
+    let ratchet_state_inbound = Arc::clone(&ratchet_state);
     tokio::spawn(async move {
         while let Some(message) = inbound.message().await.transpose() {
             match message {
-                Ok(server_message) => {
-                    println!();
-                    println!("{}", format_server_message(server_message));
-                    print!("> ");
-                }
+                Ok(server_message) => match server_message.message_type {
+                    Some(server_message::MessageType::JoinResponse(_)) => {
+                        println!();
+                        println!("{}", format_server_message(server_message));
+                        print!("> ");
+                    }
+                    Some(server_message::MessageType::KeyExchange(message)) => {
+                        let Some(init_message) = message.initial_message.as_ref() else {
+                            eprintln!("missing initial message in key exchange");
+                            continue;
+                        };
+
+                        let init = match pqxdh_init_from_proto(init_message) {
+                            Ok(init) => init,
+                            Err(err) => {
+                                eprintln!("failed to parse key exchange: {}", err);
+                                continue;
+                            }
+                        };
+
+                        let key_info = key_info.lock().await;
+                        let shared_key = match key_info.receive_key_exchange(&init) {
+                            Ok(shared_key) => shared_key,
+                            Err(err) => {
+                                eprintln!("failed to receive key exchange: {}", err);
+                                continue;
+                            }
+                        };
+
+                        let mut ratchet = RatchetState::new();
+                        ratchet.as_receiver(shared_key);
+                        ratchet.sending_sk = key_info.signed_prekey.private_key.clone();
+                        ratchet.sending_pk = x25519::PublicKey::from(&ratchet.sending_sk);
+                        drop(key_info);
+                        let mut guard = ratchet_state_inbound.lock().await;
+                        *guard = Some(ratchet);
+
+                        println!();
+                        println!("key exchange completed with {}", message.sender_id);
+                        print!("> ");
+                    }
+                    Some(server_message::MessageType::Encrypted(message)) => {
+                        let Some(inner) = message.ratchet_message else {
+                            eprintln!("missing ratchet message");
+                            continue;
+                        };
+                        let ratchet_message = match ratchet_message_from_proto(inner) {
+                            Ok(msg) => msg,
+                            Err(err) => {
+                                eprintln!("invalid ratchet message: {}", err);
+                                continue;
+                            }
+                        };
+                        let mut guard = ratchet_state_inbound.lock().await;
+                        if let Some(ratchet) = guard.as_mut() {
+                            ratchet.receive_message(ratchet_message, RATCHET_AD);
+                            print!("> ");
+                        } else {
+                            eprintln!("received message before key exchange");
+                        }
+                    }
+                    None => {
+                        eprintln!("server sent an empty message");
+                    }
+                },
                 Err(status) => {
                     eprintln!("stream error: {}", status);
                     break;
@@ -284,25 +399,43 @@ async fn main() -> Result<()> {
         }
     });
 
-    let mut counter = 1;
     while let Some(line) = lines.next_line().await? {
         if line == "exit" {
             break;
         }
-        let encrypted_message = EncryptedMessage {
-            sender_id: user.username.to_string(),
-            receiver_id: receiver.clone(),
-            ratchet_message: Some(make_dummy_ratchet_message(line.into_bytes(), counter)),
-            timestamp: None,
-        };
-        counter = counter.saturating_add(1);
 
-        tx.send(ClientMessage {
-            message_type: Some(client_message::MessageType::EncryptedMessage(
-                encrypted_message,
-            )),
-        })
-        .await?;
+        // TODO: this should automatically be done, however currently there is no way of storing
+        // messages and therefore both clients need to connect before writing this message.
+        if line == "/init" {
+            let (key_message, r_state) = user.create_key_exchange_message(args[2].clone()).await?;
+            let mut guard = ratchet_state.lock().await;
+            *guard = Some(r_state);
+
+            tx.send(ClientMessage {
+                message_type: Some(client_message::MessageType::KeyExchangeMessage(key_message)),
+            })
+            .await?;
+
+            continue;
+        }
+
+        let mut guard = ratchet_state.lock().await;
+        if let Some(s) = guard.as_mut() {
+            let msg = s.send_message(&line, RATCHET_AD);
+            let rpc_message = EncryptedMessage {
+                sender_id: args[1].clone(),
+                receiver_id: receiver.clone(),
+                ratchet_message: Some(ratchet_message_to_proto(msg)),
+                timestamp: None,
+            };
+
+            tx.send(ClientMessage {
+                message_type: Some(client_message::MessageType::EncryptedMessage(rpc_message)),
+            })
+            .await?;
+        } else {
+            println!("you need to init the key exchange");
+        }
         print!("> ");
     }
 
