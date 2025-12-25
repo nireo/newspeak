@@ -1,3 +1,4 @@
+use anyhow::{Result, anyhow};
 use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit,
     aead::{AeadMut, Payload},
@@ -60,7 +61,11 @@ impl RatchetState {
         self.root_key = shared_key;
     }
 
-    pub fn send_message(&mut self, message: &str, aditionnal_data: &[u8]) -> RatchetMessage {
+    pub fn send_message(
+        &mut self,
+        message: &str,
+        aditionnal_data: &[u8],
+    ) -> Result<RatchetMessage> {
         // state.CKs, mk = KDF_CK(state.CKs)
         let (new_chain_key_sending, message_key) = kdf_chain_key(&self.chain_key_sending);
         self.chain_key_sending = new_chain_key_sending;
@@ -76,8 +81,7 @@ impl RatchetState {
         };
 
         // ENCRYPT(mk, plaintext, AD || header)
-        let mut cipher = ChaCha20Poly1305::new(&message_key.try_into().unwrap());
-        // TODO: also use the encoded header as aditionnal_data
+        let mut cipher = ChaCha20Poly1305::new(&message_key.try_into()?);
         let ciphertext = cipher
             .encrypt(
                 (&nonce).into(),
@@ -86,15 +90,19 @@ impl RatchetState {
                     aad: aditionnal_data,
                 },
             )
-            .unwrap();
+            .map_err(|e| anyhow!("failed to encrypt message: {}", e.to_string()))?;
 
         let message = RatchetMessage { header, ciphertext };
         self.sending_counter += 1;
 
-        return message;
+        Ok(message)
     }
 
-    pub fn receive_message(&mut self, message: RatchetMessage, aditionnal_data: &[u8]) {
+    pub fn receive_message(
+        &mut self,
+        message: RatchetMessage,
+        aditionnal_data: &[u8],
+    ) -> Result<()> {
         if self.receiving_pk != Some(message.header.pk) {
             // state.DHr = header.dh
             self.receiving_pk = Some(message.header.pk);
@@ -122,7 +130,7 @@ impl RatchetState {
         self.chain_key_receiving = chain_key_receiving;
 
         //  DECRYPT(mk, ciphertext, CONCAT(AD, header))
-        let mut cipher = ChaCha20Poly1305::new(&message_key.try_into().unwrap());
+        let mut cipher = ChaCha20Poly1305::new(&message_key.try_into()?);
         let plaintext = cipher
             .decrypt(
                 (&message.header.nonce).into(),
@@ -131,14 +139,16 @@ impl RatchetState {
                     aad: aditionnal_data,
                 },
             )
-            .unwrap();
-        let message_plaintext = String::from_utf8(plaintext).unwrap();
+            .map_err(|e| anyhow!("failed to decrypt message: {}", e.to_string()))?;
 
+        let message_plaintext = String::from_utf8(plaintext)?;
         println!(
             "< received [{}]: {message_plaintext}",
             self.receiving_counter
         );
         self.receiving_counter += 1;
+
+        Ok(())
     }
 }
 
@@ -188,12 +198,12 @@ mod tests {
         bob.as_receiver(shared_key);
 
         let ad = b"header-data";
-        let message = alice.send_message("hello", ad);
+        let message = alice.send_message("hello", ad).unwrap();
 
         assert_eq!(alice.sending_counter, 1);
         assert_eq!(bob.receiving_counter, 0);
 
-        bob.receive_message(message, ad);
+        bob.receive_message(message, ad).unwrap();
 
         assert_eq!(bob.receiving_counter, 1);
         assert_eq!(bob.receiving_pk, Some(alice.sending_pk));
@@ -210,12 +220,12 @@ mod tests {
         bob.as_receiver(shared_key);
 
         let ad = b"ratchet-ad";
-        let to_bob = alice.send_message("ping", ad);
-        bob.receive_message(to_bob, ad);
+        let to_bob = alice.send_message("ping", ad).unwrap();
+        bob.receive_message(to_bob, ad).unwrap();
 
         let bob_reply_pk = ecdh::PublicKey::from(&bob.sending_sk);
-        let to_alice = bob.send_message("pong", ad);
-        alice.receive_message(to_alice, ad);
+        let to_alice = bob.send_message("pong", ad).unwrap();
+        alice.receive_message(to_alice, ad).unwrap();
 
         assert_eq!(alice.receiving_pk, Some(bob_reply_pk));
         assert_eq!(alice.receiving_counter, 1);
@@ -234,7 +244,7 @@ mod tests {
         alice.as_initiator(shared_key, bob_pk);
         bob.as_receiver(shared_key);
 
-        let message = alice.send_message("secret", b"correct-ad");
-        bob.receive_message(message, b"incorrect-ad");
+        let message = alice.send_message("secret", b"correct-ad").unwrap();
+        bob.receive_message(message, b"incorrect-ad").unwrap();
     }
 }

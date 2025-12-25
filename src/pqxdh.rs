@@ -315,7 +315,7 @@ impl KeyExchangeUser {
         let mlkem_shared_secret = self
             .last_resort_kem
             .decap_key
-            .decapsulate(message.mlkem_ciphertext.as_slice().try_into().unwrap())
+            .decapsulate(message.mlkem_ciphertext.as_slice().try_into()?)
             .map_err(|_| Error::msg("failed to decapsulate with ML-KEM-1024"))?;
 
         let alice_identity_public_key_x25519 =

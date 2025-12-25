@@ -381,7 +381,9 @@ async fn main() -> Result<()> {
                         };
                         let mut guard = ratchet_state_inbound.lock().await;
                         if let Some(ratchet) = guard.as_mut() {
-                            ratchet.receive_message(ratchet_message, RATCHET_AD);
+                            if let Err(err) = ratchet.receive_message(ratchet_message, RATCHET_AD) {
+                                println!("failed to receive mesesage: {}", err.to_string());
+                            }
                             print!("> ");
                         } else {
                             eprintln!("received message before key exchange");
@@ -422,6 +424,14 @@ async fn main() -> Result<()> {
         let mut guard = ratchet_state.lock().await;
         if let Some(s) = guard.as_mut() {
             let msg = s.send_message(&line, RATCHET_AD);
+            if let Err(err) = &msg {
+                println!(
+                    "failed to construct message, not sending...: {}",
+                    err.to_string()
+                )
+            }
+            let msg = msg.unwrap();
+
             let rpc_message = EncryptedMessage {
                 sender_id: args[1].clone(),
                 receiver_id: receiver.clone(),
