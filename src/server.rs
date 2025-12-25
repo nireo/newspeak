@@ -45,6 +45,7 @@ impl Newspeak for NewspeakService {
             return Err(Status::invalid_argument("username is required"));
         }
 
+        println!("fetches prekey bundle for: {}", request.username);
         let username = request.username;
         let db = Arc::clone(&self.db);
         let bundle = db
@@ -192,6 +193,10 @@ impl Newspeak for NewspeakService {
                         }
                         Some(client_message::MessageType::EncryptedMessage(message)) => {
                             let target = message.receiver_id.clone();
+                            println!(
+                                "message: {}",
+                                hex::encode(&message.ratchet_message.as_ref().unwrap().ciphertext)
+                            );
                             let server_message = ServerMessage {
                                 message_type: Some(server_message::MessageType::Encrypted(message)),
                             };

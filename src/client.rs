@@ -406,6 +406,10 @@ async fn main() -> Result<()> {
             break;
         }
 
+        if line == "" {
+            continue;
+        }
+
         // TODO: this should automatically be done, however currently there is no way of storing
         // messages and therefore both clients need to connect before writing this message.
         if line == "/init" {
