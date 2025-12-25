@@ -13,7 +13,7 @@ use sha3::{
 };
 use x25519_dalek::{self as x25519};
 
-type KemId = [u8; 16];
+pub type KemId = [u8; 16];
 
 pub struct KeyExchangeUser {
     pub identity_sk: ed25519::SigningKey,
@@ -46,6 +46,18 @@ impl<I: Hash + Eq, T: Clone> KeyStore<I, T> {
         }
     }
 
+    pub fn get(&self, id: &I) -> Option<&T> {
+        self.store.get(id).map(|entry| &entry.key)
+    }
+
+    pub fn is_used(&self, id: &I) -> Option<bool> {
+        self.store.get(id).map(|entry| entry.used)
+    }
+
+    pub fn len(&self) -> usize {
+        self.store.len()
+    }
+
     pub fn get_id(&self, id: &I) -> Option<&OneTimeKey<T>> {
         self.store.get(id)
     }
@@ -62,6 +74,16 @@ impl<I: Hash + Eq, T: Clone> KeyStore<I, T> {
             OneTimeKey {
                 key: key,
                 used: false,
+            },
+        );
+    }
+
+    pub fn insert_with_used(&mut self, id: I, key: T, used: bool) {
+        self.store.insert(
+            id,
+            OneTimeKey {
+                key: key,
+                used: used,
             },
         );
     }
