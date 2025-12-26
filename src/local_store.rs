@@ -13,6 +13,7 @@ use crate::pqxdh;
 use crate::pqxdh::KemId;
 use crate::pqxdh::KeyStore;
 use crate::pqxdh::SignedMlKemPrekey;
+use crate::ratchet::RatchetState;
 
 #[derive(Clone)]
 pub struct LocalStorage {
@@ -302,6 +303,70 @@ impl LocalStorage {
         Ok(key_store)
     }
 
+    pub async fn get_conversation(
+        &self,
+        username: &str,
+        peer: &str,
+    ) -> Result<Option<RatchetState>> {
+        let db = Arc::clone(&self.db);
+        let username = username.to_string();
+        let peer = peer.to_string();
+        let row = db
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT ratchet_state
+                     FROM conversations
+                     WHERE username = ?1 AND peer = ?2",
+                    params![username, peer],
+                    |row| {
+                        let ratchet_state: Vec<u8> = row.get(0)?;
+                        Ok(ratchet_state)
+                    },
+                )
+                .optional()
+            })
+            .await
+            .map_err(|err| anyhow!(err))?;
+
+        let Some(ratchet_state) = row else {
+            return Ok(None);
+        };
+
+        Ok(Some(ratchet_state_from_bytes(&ratchet_state)?))
+    }
+
+    pub async fn update_conversation(
+        &self,
+        username: &str,
+        peer: &str,
+        ratchet_state: &RatchetState,
+    ) -> Result<()> {
+        let ratchet_state = ratchet_state_to_bytes(ratchet_state);
+        let db = Arc::clone(&self.db);
+        let username = username.to_string();
+        let peer = peer.to_string();
+
+        db.call(move |conn| {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT INTO conversations (
+                    username,
+                    peer,
+                    ratchet_state
+                ) VALUES (?1, ?2, ?3)
+                ON CONFLICT(username, peer)
+                DO UPDATE SET ratchet_state = excluded.ratchet_state",
+                params![username, peer, ratchet_state],
+            )?;
+            tx.commit()?;
+            Ok::<(), RusqliteError>(())
+        })
+        .await
+        .map_err(|err| anyhow!(err))?;
+
+        Ok(())
+    }
+
     async fn init_migrations(conn: &Connection) -> Result<(), TokioRusqliteError<RusqliteError>> {
         // some thoughts on the schema: for a relational format it makes more sense to store the
         // user like this, overall sqlite is very reliable and a good also for internal storage in
@@ -309,6 +374,11 @@ impl LocalStorage {
         //
         // also having a blob as the kem key id seems quite weird, but it makes sense since they're
         // internally stored that way and there is no point in having a different id column.
+        //
+        // we need to store the entire ratchet states for each conversation
+        //
+        // TODO: might be easier to store all content as bytes blos and deserialize on load,
+        //       but that would make queries harder if we want to do anything more complex later on
 
         conn.call(|conn| {
             conn.execute_batch(
@@ -319,7 +389,7 @@ impl LocalStorage {
                     signed_prekey_sk BLOB NOT NULL,
                     kem_decap BLOB NOT NULL
                 );
-                
+
                 CREATE TABLE IF NOT EXISTS kem_keys(
                     id BLOB PRIMARY KEY,
                     username TEXT NOT NULL,
@@ -333,6 +403,14 @@ impl LocalStorage {
                     username TEXT NOT NULL,
                     sk BLOB NOT NULL,
                     used INTEGER NOT NULL,
+                    FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS conversations(
+                    username TEXT NOT NULL,
+                    peer TEXT NOT NULL,
+                    ratchet_state BLOB NOT NULL,
+                    PRIMARY KEY (username, peer),
                     FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
                 );",
             )?;
@@ -394,6 +472,79 @@ fn bytes_to_16(bytes: &[u8]) -> Result<[u8; 16]> {
     bytes
         .try_into()
         .map_err(|_| anyhow!("invalid key length: {}", bytes.len()))
+}
+
+fn ratchet_state_to_bytes(state: &RatchetState) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(209);
+    bytes.extend_from_slice(&state.sending_sk.to_bytes());
+    bytes.extend_from_slice(state.sending_pk.as_bytes());
+    match &state.receiving_pk {
+        Some(pk) => {
+            bytes.push(1u8);
+            bytes.extend_from_slice(pk.as_bytes());
+        }
+        None => {
+            bytes.push(0u8);
+            bytes.extend_from_slice(&[0u8; 32]);
+        }
+    }
+    bytes.extend_from_slice(&state.receiving_counter.to_le_bytes());
+    bytes.extend_from_slice(&state.sending_counter.to_le_bytes());
+    bytes.extend_from_slice(&state.root_key);
+    bytes.extend_from_slice(&state.chain_key_sending);
+    bytes.extend_from_slice(&state.chain_key_receiving);
+    bytes
+}
+
+fn ratchet_state_from_bytes(bytes: &[u8]) -> Result<RatchetState> {
+    const EXPECTED_LEN: usize = 209;
+    if bytes.len() != EXPECTED_LEN {
+        return Err(anyhow!("invalid ratchet state length: {}", bytes.len()));
+    }
+
+    let mut offset = 0;
+    let sending_sk = bytes_to_32(&bytes[offset..offset + 32])?;
+    offset += 32;
+    let sending_pk = bytes_to_32(&bytes[offset..offset + 32])?;
+    offset += 32;
+    let has_receiving = bytes[offset];
+    offset += 1;
+    let receiving_pk_bytes = bytes_to_32(&bytes[offset..offset + 32])?;
+    offset += 32;
+    let receiving_counter = u64::from_le_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .map_err(|_| anyhow!("invalid receiving counter length"))?,
+    );
+    offset += 8;
+    let sending_counter = u64::from_le_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .map_err(|_| anyhow!("invalid sending counter length"))?,
+    );
+    offset += 8;
+    let root_key = bytes_to_32(&bytes[offset..offset + 32])?;
+    offset += 32;
+    let chain_key_sending = bytes_to_32(&bytes[offset..offset + 32])?;
+    offset += 32;
+    let chain_key_receiving = bytes_to_32(&bytes[offset..offset + 32])?;
+
+    let receiving_pk = if has_receiving == 1 {
+        Some(x25519::PublicKey::from(receiving_pk_bytes))
+    } else {
+        None
+    };
+
+    Ok(RatchetState {
+        sending_sk: x25519::StaticSecret::from(sending_sk),
+        sending_pk: x25519::PublicKey::from(sending_pk),
+        receiving_pk,
+        receiving_counter,
+        sending_counter,
+        root_key,
+        chain_key_sending,
+        chain_key_receiving,
+    })
 }
 
 #[cfg(test)]
@@ -525,6 +676,68 @@ mod tests {
             user.last_resort_kem.encap_key.as_bytes(),
             loaded.last_resort_kem.encap_key.as_bytes()
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conversation_roundtrip() -> Result<()> {
+        let db = TempDb::new();
+        let storage = LocalStorage::new_with_path(&db.path).await?;
+        storage.load_or_create_user("alice").await?;
+
+        let shared_key: [u8; 32] = rand::random();
+        let mut alice = RatchetState::new();
+        let bob = RatchetState::new();
+        alice.as_initiator(shared_key, bob.sending_pk);
+        let _ = alice.send_message("hello", b"ratchet-ad")?;
+
+        storage
+            .update_conversation("alice", "bob", &alice)
+            .await?;
+        let loaded = storage.get_conversation("alice", "bob").await?;
+        let loaded = loaded.expect("conversation");
+
+        assert_eq!(alice.sending_sk.to_bytes(), loaded.sending_sk.to_bytes());
+        assert_eq!(alice.sending_pk.as_bytes(), loaded.sending_pk.as_bytes());
+        assert_eq!(
+            alice.receiving_pk.map(|pk| pk.as_bytes().to_owned()),
+            loaded.receiving_pk.map(|pk| pk.as_bytes().to_owned())
+        );
+        assert_eq!(alice.receiving_counter, loaded.receiving_counter);
+        assert_eq!(alice.sending_counter, loaded.sending_counter);
+        assert_eq!(alice.root_key, loaded.root_key);
+        assert_eq!(alice.chain_key_sending, loaded.chain_key_sending);
+        assert_eq!(alice.chain_key_receiving, loaded.chain_key_receiving);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_conversation_overwrites_state() -> Result<()> {
+        let db = TempDb::new();
+        let storage = LocalStorage::new_with_path(&db.path).await?;
+        storage.load_or_create_user("alice").await?;
+
+        let shared_key: [u8; 32] = rand::random();
+        let mut alice = RatchetState::new();
+        let bob = RatchetState::new();
+        alice.as_initiator(shared_key, bob.sending_pk);
+        storage
+            .update_conversation("alice", "bob", &alice)
+            .await?;
+
+        let _ = alice.send_message("hello", b"ratchet-ad")?;
+        storage
+            .update_conversation("alice", "bob", &alice)
+            .await?;
+        let loaded = storage
+            .get_conversation("alice", "bob")
+            .await?
+            .expect("conversation");
+
+        assert_eq!(alice.sending_counter, loaded.sending_counter);
+        assert_eq!(alice.chain_key_sending, loaded.chain_key_sending);
 
         Ok(())
     }

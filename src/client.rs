@@ -320,9 +320,17 @@ async fn main() -> Result<()> {
     })
     .await?;
 
-    let ratchet_state = Arc::new(Mutex::new(None));
+    let stored_conversation = storage
+        .get_conversation(&args[1], &receiver)
+        .await?;
+    if stored_conversation.is_some() {
+        println!("loaded conversation state for {}", receiver);
+    }
+    let ratchet_state = Arc::new(Mutex::new(stored_conversation));
     let key_info = Arc::clone(&user.key_info);
     let ratchet_state_inbound = Arc::clone(&ratchet_state);
+    let storage_inbound = storage.clone();
+    let username_inbound = args[1].clone();
     tokio::spawn(async move {
         while let Some(message) = inbound.message().await.transpose() {
             match message {
@@ -362,6 +370,14 @@ async fn main() -> Result<()> {
                         drop(key_info);
                         let mut guard = ratchet_state_inbound.lock().await;
                         *guard = Some(ratchet);
+                        if let Some(state) = guard.as_ref() {
+                            if let Err(err) = storage_inbound
+                                .update_conversation(&username_inbound, &message.sender_id, state)
+                                .await
+                            {
+                                eprintln!("failed to update conversation: {}", err);
+                            }
+                        }
 
                         println!();
                         println!("key exchange completed with {}", message.sender_id);
@@ -380,9 +396,22 @@ async fn main() -> Result<()> {
                             }
                         };
                         let mut guard = ratchet_state_inbound.lock().await;
+                        if guard.is_none() {
+                            if let Ok(Some(state)) = storage_inbound
+                                .get_conversation(&username_inbound, &message.sender_id)
+                                .await
+                            {
+                                *guard = Some(state);
+                            }
+                        }
                         if let Some(ratchet) = guard.as_mut() {
                             if let Err(err) = ratchet.receive_message(ratchet_message, RATCHET_AD) {
                                 println!("failed to receive mesesage: {}", err.to_string());
+                            } else if let Err(err) = storage_inbound
+                                .update_conversation(&username_inbound, &message.sender_id, ratchet)
+                                .await
+                            {
+                                eprintln!("failed to update conversation: {}", err);
                             }
                             print!("> ");
                         } else {
@@ -416,6 +445,11 @@ async fn main() -> Result<()> {
             let (key_message, r_state) = user.create_key_exchange_message(args[2].clone()).await?;
             let mut guard = ratchet_state.lock().await;
             *guard = Some(r_state);
+            if let Some(state) = guard.as_ref() {
+                storage
+                    .update_conversation(&args[1], &receiver, state)
+                    .await?;
+            }
 
             tx.send(ClientMessage {
                 message_type: Some(client_message::MessageType::KeyExchangeMessage(key_message)),
@@ -442,6 +476,9 @@ async fn main() -> Result<()> {
                 ratchet_message: Some(ratchet_message_to_proto(msg)),
                 timestamp: None,
             };
+            if let Err(err) = storage.update_conversation(&args[1], &receiver, s).await {
+                eprintln!("failed to update conversation: {}", err);
+            }
 
             tx.send(ClientMessage {
                 message_type: Some(client_message::MessageType::EncryptedMessage(rpc_message)),
