@@ -102,7 +102,7 @@ impl RatchetState {
         &mut self,
         message: RatchetMessage,
         aditionnal_data: &[u8],
-    ) -> Result<()> {
+    ) -> Result<String> {
         if self.receiving_pk != Some(message.header.pk) {
             // state.DHr = header.dh
             self.receiving_pk = Some(message.header.pk);
@@ -142,13 +142,9 @@ impl RatchetState {
             .map_err(|e| anyhow!("failed to decrypt message: {}", e.to_string()))?;
 
         let message_plaintext = String::from_utf8(plaintext)?;
-        println!(
-            "< received [{}]: {message_plaintext}",
-            self.receiving_counter
-        );
         self.receiving_counter += 1;
 
-        Ok(())
+        Ok(message_plaintext)
     }
 }
 

@@ -15,6 +15,11 @@ use crate::pqxdh::KeyStore;
 use crate::pqxdh::SignedMlKemPrekey;
 use crate::ratchet::RatchetState;
 
+pub struct ConversationMessage {
+    pub content: String,
+    pub is_sender: bool,
+}
+
 #[derive(Clone)]
 pub struct LocalStorage {
     db: Arc<Connection>,
@@ -367,6 +372,104 @@ impl LocalStorage {
         Ok(())
     }
 
+    pub async fn add_message(
+        &self,
+        username: &str,
+        peer: &str,
+        content: &str,
+        is_sender: bool,
+    ) -> Result<()> {
+        let conversation_id = self
+            .get_conversation_id(username, peer)
+            .await?
+            .ok_or_else(|| anyhow!("conversation not found"))?;
+        let db = Arc::clone(&self.db);
+        let content = content.to_string();
+        let is_sender = if is_sender { 1 } else { 0 };
+
+        db.call(move |conn| {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT INTO messages (
+                    conversation_id,
+                    content,
+                    is_sender
+                ) VALUES (?1, ?2, ?3)",
+                params![conversation_id, content, is_sender],
+            )?;
+            tx.commit()?;
+            Ok::<(), RusqliteError>(())
+        })
+        .await
+        .map_err(|err| anyhow!(err))?;
+
+        Ok(())
+    }
+
+    pub async fn get_conversation_messages(
+        &self,
+        username: &str,
+        peer: &str,
+    ) -> Result<Vec<ConversationMessage>> {
+        let Some(conversation_id) = self.get_conversation_id(username, peer).await? else {
+            return Ok(Vec::new());
+        };
+        let db = Arc::clone(&self.db);
+
+        let rows = db
+            .call(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT content, is_sender
+                     FROM messages
+                     WHERE conversation_id = ?1
+                     ORDER BY id ASC",
+                )?;
+                let rows = stmt.query_map(params![conversation_id], |row| {
+                    let content: String = row.get(0)?;
+                    let is_sender: i64 = row.get(1)?;
+                    Ok((content, is_sender))
+                })?;
+                let mut results = Vec::new();
+                for row in rows {
+                    results.push(row?);
+                }
+                Ok::<_, RusqliteError>(results)
+            })
+            .await
+            .map_err(|err| anyhow!(err))?;
+
+        let messages = rows
+            .into_iter()
+            .map(|(content, is_sender)| ConversationMessage {
+                content,
+                is_sender: is_sender != 0,
+            })
+            .collect();
+
+        Ok(messages)
+    }
+
+    async fn get_conversation_id(&self, username: &str, peer: &str) -> Result<Option<i64>> {
+        let db = Arc::clone(&self.db);
+        let username = username.to_string();
+        let peer = peer.to_string();
+        let row = db
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT id
+                     FROM conversations
+                     WHERE username = ?1 AND peer = ?2",
+                    params![username, peer],
+                    |row| row.get(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(|err| anyhow!(err))?;
+
+        Ok(row)
+    }
+
     async fn init_migrations(conn: &Connection) -> Result<(), TokioRusqliteError<RusqliteError>> {
         // some thoughts on the schema: for a relational format it makes more sense to store the
         // user like this, overall sqlite is very reliable and a good also for internal storage in
@@ -404,16 +507,64 @@ impl LocalStorage {
                     sk BLOB NOT NULL,
                     used INTEGER NOT NULL,
                     FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS conversations(
-                    username TEXT NOT NULL,
-                    peer TEXT NOT NULL,
-                    ratchet_state BLOB NOT NULL,
-                    PRIMARY KEY (username, peer),
-                    FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
                 );",
             )?;
+
+            let has_conversations: Option<String> = conn
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'conversations'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            if has_conversations.is_some() {
+                let mut stmt = conn.prepare("PRAGMA table_info(conversations)")?;
+                let columns = stmt
+                    .query_map([], |row| {
+                        let name: String = row.get(1)?;
+                        Ok(name)
+                    })?
+                    .collect::<Result<Vec<String>, RusqliteError>>()?;
+                if !columns.iter().any(|name| name == "id") {
+                    conn.execute_batch(
+                        "ALTER TABLE conversations RENAME TO conversations_old;
+                        CREATE TABLE conversations(
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            username TEXT NOT NULL,
+                            peer TEXT NOT NULL,
+                            ratchet_state BLOB NOT NULL,
+                            UNIQUE (username, peer),
+                            FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
+                        );
+                        INSERT INTO conversations (username, peer, ratchet_state)
+                            SELECT username, peer, ratchet_state FROM conversations_old;
+                        DROP TABLE conversations_old;",
+                    )?;
+                }
+            } else {
+                conn.execute_batch(
+                    "CREATE TABLE conversations(
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT NOT NULL,
+                        peer TEXT NOT NULL,
+                        ratchet_state BLOB NOT NULL,
+                        UNIQUE (username, peer),
+                        FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
+                    );",
+                )?;
+            }
+
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS messages(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    is_sender INTEGER NOT NULL,
+                    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+                );",
+            )?;
+
             Ok::<(), RusqliteError>(())
         })
         .await
@@ -738,6 +889,37 @@ mod tests {
 
         assert_eq!(alice.sending_counter, loaded.sending_counter);
         assert_eq!(alice.chain_key_sending, loaded.chain_key_sending);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conversation_messages_roundtrip() -> Result<()> {
+        let db = TempDb::new();
+        let storage = LocalStorage::new_with_path(&db.path).await?;
+        storage.load_or_create_user("alice").await?;
+
+        let shared_key: [u8; 32] = rand::random();
+        let mut alice = RatchetState::new();
+        let bob = RatchetState::new();
+        alice.as_initiator(shared_key, bob.sending_pk);
+        storage
+            .update_conversation("alice", "bob", &alice)
+            .await?;
+
+        storage
+            .add_message("alice", "bob", "hi bob", true)
+            .await?;
+        storage
+            .add_message("alice", "bob", "hi alice", false)
+            .await?;
+
+        let messages = storage.get_conversation_messages("alice", "bob").await?;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "hi bob");
+        assert!(messages[0].is_sender);
+        assert_eq!(messages[1].content, "hi alice");
+        assert!(!messages[1].is_sender);
 
         Ok(())
     }

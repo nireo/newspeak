@@ -325,6 +325,16 @@ async fn main() -> Result<()> {
         .await?;
     if stored_conversation.is_some() {
         println!("loaded conversation state for {}", receiver);
+        let history = storage
+            .get_conversation_messages(&args[1], &receiver)
+            .await?;
+        for message in history {
+            if message.is_sender {
+                println!("you: {}", message.content);
+            } else {
+                println!("{}: {}", receiver, message.content);
+            }
+        }
     }
     let ratchet_state = Arc::new(Mutex::new(stored_conversation));
     let key_info = Arc::clone(&user.key_info);
@@ -405,15 +415,27 @@ async fn main() -> Result<()> {
                             }
                         }
                         if let Some(ratchet) = guard.as_mut() {
-                            if let Err(err) = ratchet.receive_message(ratchet_message, RATCHET_AD) {
-                                println!("failed to receive mesesage: {}", err.to_string());
-                            } else if let Err(err) = storage_inbound
-                                .update_conversation(&username_inbound, &message.sender_id, ratchet)
-                                .await
-                            {
-                                eprintln!("failed to update conversation: {}", err);
+                            match ratchet.receive_message(ratchet_message, RATCHET_AD) {
+                                Ok(plaintext) => {
+                                    println!("< received [{}]: {}", ratchet.receiving_counter - 1, plaintext);
+                                    if let Err(err) = storage_inbound
+                                        .add_message(&username_inbound, &message.sender_id, &plaintext, false)
+                                        .await
+                                    {
+                                        eprintln!("failed to store message: {}", err);
+                                    }
+                                    if let Err(err) = storage_inbound
+                                        .update_conversation(&username_inbound, &message.sender_id, ratchet)
+                                        .await
+                                    {
+                                        eprintln!("failed to update conversation: {}", err);
+                                    }
+                                    print!("> ");
+                                }
+                                Err(err) => {
+                                    println!("failed to receive mesesage: {}", err.to_string());
+                                }
                             }
-                            print!("> ");
                         } else {
                             eprintln!("received message before key exchange");
                         }
@@ -476,6 +498,9 @@ async fn main() -> Result<()> {
                 ratchet_message: Some(ratchet_message_to_proto(msg)),
                 timestamp: None,
             };
+            if let Err(err) = storage.add_message(&args[1], &receiver, &line, true).await {
+                eprintln!("failed to store message: {}", err);
+            }
             if let Err(err) = storage.update_conversation(&args[1], &receiver, s).await {
                 eprintln!("failed to update conversation: {}", err);
             }
