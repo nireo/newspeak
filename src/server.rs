@@ -3,6 +3,7 @@ pub mod newspeak {
 }
 
 use blake3;
+use ed25519_dalek::VerifyingKey;
 use newspeak::newspeak_server::{Newspeak, NewspeakServer};
 use newspeak::{
     FetchPrekeyBundleRequest, FetchPrekeyBundleResponse, PrekeyBundle, RegisterRequest,
@@ -19,12 +20,15 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::newspeak::{ClientMessage, JoinResponse, ServerMessage, client_message, server_message};
+use crate::newspeak::{
+    AddSignedPrekeysRequest, AddSignedPrekeysResponse, ClientMessage, JoinResponse, ServerMessage,
+    client_message, server_message,
+};
 
 #[derive(Clone)]
 struct NewspeakService {
-    db: Arc<Connection>,
     users: Arc<Mutex<HashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>>,
+    server_store: ServerStore,
 }
 
 struct StoredPrekey {
@@ -32,21 +36,131 @@ struct StoredPrekey {
     prekey: SignedPrekey,
 }
 
-#[tonic::async_trait]
-impl Newspeak for NewspeakService {
-    type MessageStreamStream = ReceiverStream<Result<ServerMessage, Status>>;
+struct ServerUser {
+    id: Option<i64>,
+    username: String,
+    identity_key: Vec<u8>,
+    signed_prekey: SignedPrekey,
+    kem_prekey: SignedPrekey,
+    one_time_prekeys: Vec<SignedPrekey>,
+}
 
-    async fn fetch_prekey_bundle(
-        &self,
-        request: Request<FetchPrekeyBundleRequest>,
-    ) -> Result<Response<FetchPrekeyBundleResponse>, Status> {
-        let request = request.into_inner();
-        if request.username.is_empty() {
-            return Err(Status::invalid_argument("username is required"));
-        }
+#[derive(Clone)]
+struct ServerStore {
+    db: Arc<Connection>,
+}
 
-        println!("fetches prekey bundle for: {}", request.username);
-        let username = request.username;
+impl ServerStore {
+    fn new(db: Arc<Connection>) -> Self {
+        Self { db }
+    }
+
+    async fn insert_user(&self, user: ServerUser) -> Result<(), Status> {
+        let db = Arc::clone(&self.db);
+        db.call(move |conn| {
+            let tx = conn.transaction()?;
+
+            tx.execute(
+                "INSERT INTO users (
+                    username,
+                    identity_key,
+                    signed_prekey_kind,
+                    signed_prekey_key,
+                    signed_prekey_signature,
+                    kem_prekey_kind,
+                    kem_prekey_key,
+                    kem_prekey_signature
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    user.username,
+                    user.identity_key,
+                    user.signed_prekey.kind,
+                    user.signed_prekey.key,
+                    user.signed_prekey.signature,
+                    user.kem_prekey.kind,
+                    user.kem_prekey.key,
+                    user.kem_prekey.signature
+                ],
+            )?;
+
+            let user_id = tx.last_insert_rowid();
+
+            for prekey in user.one_time_prekeys {
+                insert_one_time_key(&tx, "one_time_prekeys", user_id, &prekey)?;
+            }
+
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(map_db_error)?;
+        Ok(())
+    }
+
+    async fn get_user(&self, username: String) -> Result<ServerUser, Status> {
+        let db = Arc::clone(&self.db);
+        let user = db
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+
+                let user_row: Option<ServerUser> = tx
+                    .query_row(
+                        "SELECT id,
+                                identity_key,
+                                signed_prekey_kind,
+                                signed_prekey_key,
+                                signed_prekey_signature,
+                                kem_prekey_kind,
+                                kem_prekey_key,
+                                kem_prekey_signature
+                        FROM users
+                        WHERE username = ?1",
+                        params![username],
+                        |row| {
+                            let user_id: i64 = row.get(0)?;
+                            let identity_key: Vec<u8> = row.get(1)?;
+                            let signed_prekey_kind: i32 = row.get(2)?;
+                            let signed_prekey_key: Vec<u8> = row.get(3)?;
+                            let signed_prekey_signature: Vec<u8> = row.get(4)?;
+                            let kem_prekey_kind: i32 = row.get(5)?;
+                            let kem_prekey_key: Vec<u8> = row.get(6)?;
+                            let kem_prekey_signature: Vec<u8> = row.get(7)?;
+                            Ok(ServerUser {
+                                id: Some(user_id),
+                                username: username.to_string(),
+                                identity_key,
+                                signed_prekey: SignedPrekey {
+                                    kind: signed_prekey_kind,
+                                    key: signed_prekey_key,
+                                    signature: signed_prekey_signature,
+                                },
+                                kem_prekey: SignedPrekey {
+                                    kind: kem_prekey_kind,
+                                    key: kem_prekey_key,
+                                    signature: kem_prekey_signature,
+                                },
+                                one_time_prekeys: Vec::new(), // to be filled later
+                            })
+                        },
+                    )
+                    .optional()?;
+
+                if user_row.is_none() {
+                    return Ok(None);
+                }
+
+                tx.commit()?;
+
+                // unwrap is safe here because of the earlier check
+                Ok(Some(user_row.unwrap()))
+            })
+            .await
+            .map_err(map_db_error)?;
+        let user = user.ok_or_else(|| Status::not_found("username not registered"))?;
+        Ok(user)
+    }
+
+    async fn fetch_prekey_bundle(&self, username: String) -> Result<PrekeyBundle, Status> {
         let db = Arc::clone(&self.db);
         let bundle = db
             .call(move |conn| {
@@ -127,7 +241,49 @@ impl Newspeak for NewspeakService {
             .await
             .map_err(map_db_error)?;
 
-        let bundle = bundle.ok_or_else(|| Status::not_found("username not registered"))?;
+        bundle.ok_or_else(|| Status::not_found("username not registered"))
+    }
+
+    async fn add_one_time_prekeys(
+        &self,
+        user_id: i64,
+        prekeys: Vec<SignedPrekey>,
+        kem_prekeys: Vec<SignedPrekey>,
+    ) -> Result<i32, Status> {
+        let db = Arc::clone(&self.db);
+        let inserted = db
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                let mut count = 0;
+                count += insert_one_time_keys(&tx, "one_time_prekeys", user_id, prekeys)?;
+                count += insert_one_time_keys(&tx, "one_time_kem_keys", user_id, kem_prekeys)?;
+                tx.commit()?;
+                Ok::<i32, RusqliteError>(count)
+            })
+            .await
+            .map_err(map_db_error)?;
+        Ok(inserted)
+    }
+}
+
+#[tonic::async_trait]
+impl Newspeak for NewspeakService {
+    type MessageStreamStream = ReceiverStream<Result<ServerMessage, Status>>;
+
+    async fn fetch_prekey_bundle(
+        &self,
+        request: Request<FetchPrekeyBundleRequest>,
+    ) -> Result<Response<FetchPrekeyBundleResponse>, Status> {
+        let request = request.into_inner();
+        if request.username.is_empty() {
+            return Err(Status::invalid_argument("username is required"));
+        }
+
+        println!("fetches prekey bundle for: {}", request.username);
+        let bundle = self
+            .server_store
+            .fetch_prekey_bundle(request.username)
+            .await?;
 
         let reply = FetchPrekeyBundleResponse {
             bundle: Some(bundle),
@@ -229,6 +385,61 @@ impl Newspeak for NewspeakService {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
+    async fn add_signed_prekeys(
+        &self,
+        request: Request<AddSignedPrekeysRequest>,
+    ) -> Result<Response<AddSignedPrekeysResponse>, Status> {
+        let request = request.into_inner();
+        if request.username.is_empty() {
+            return Err(Status::invalid_argument("username is required"));
+        }
+
+        // fetch user identity key to verify prekeys
+        let user = self.server_store.get_user(request.username).await?;
+
+        let identity_key_bytes: [u8; 32] =
+            user.identity_key.as_slice().try_into().map_err(|_| {
+                Status::internal("stored identity key has invalid length, database corrupted")
+            })?;
+
+        // we need to verify that the identity_key matches
+        let identity_pk = VerifyingKey::from_bytes(&identity_key_bytes)
+            .map_err(|_| Status::internal("stored identity key is invalid, database corrupted"))?;
+
+        let mut x25519_keys = Vec::new();
+        let mut kem_keys = Vec::new();
+
+        for key in request.keys {
+            let kind = newspeak::KeyKind::try_from(key.kind)
+                .map_err(|_| Status::invalid_argument("invalid key kind"))?;
+            let signature_bytes: [u8; 64] = key.signature.as_slice().try_into().map_err(|_| {
+                Status::invalid_argument("invalid signature length in signed prekey")
+            })?;
+
+            identity_pk
+                .verify_strict(
+                    &key.key,
+                    &ed25519_dalek::Signature::from_bytes(&signature_bytes),
+                )
+                .map_err(|_| {
+                    Status::invalid_argument("signed prekey signature verification failed")
+                })?;
+
+            match kind {
+                newspeak::KeyKind::X25519 => x25519_keys.push(key),
+                newspeak::KeyKind::MlKem1024 => kem_keys.push(key),
+            }
+        }
+
+        let user_id = user.id.ok_or_else(|| Status::internal("user id missing"))?;
+        let key_count = self
+            .server_store
+            .add_one_time_prekeys(user_id, x25519_keys, kem_keys)
+            .await?;
+
+        Ok(Response::new(AddSignedPrekeysResponse { key_count }))
+    }
+
     async fn register(
         &self,
         request: Request<RegisterRequest>,
@@ -247,45 +458,18 @@ impl Newspeak for NewspeakService {
         let username = request.username;
         let identity_key = request.identity_key;
         let one_time_prekeys = request.one_time_prekeys;
-        let db = Arc::clone(&self.db);
-        db.call(move |conn| {
-            let tx = conn.transaction()?;
 
-            tx.execute(
-                "INSERT INTO users (
-                    username,
-                    identity_key,
-                    signed_prekey_kind,
-                    signed_prekey_key,
-                    signed_prekey_signature,
-                    kem_prekey_kind,
-                    kem_prekey_key,
-                    kem_prekey_signature
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    username,
-                    identity_key,
-                    signed_prekey.kind,
-                    signed_prekey.key,
-                    signed_prekey.signature,
-                    kem_prekey.kind,
-                    kem_prekey.key,
-                    kem_prekey.signature
-                ],
-            )?;
+        let server_user = ServerUser {
+            id: None,
+            username,
+            identity_key,
+            signed_prekey,
+            kem_prekey,
+            one_time_prekeys,
+        };
+        self.server_store.insert_user(server_user).await?;
 
-            let user_id = tx.last_insert_rowid();
-
-            for prekey in one_time_prekeys {
-                insert_one_time_key(&tx, "one_time_prekeys", user_id, &prekey)?;
-            }
-
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-        .map_err(map_db_error)?;
-
+        // TODO: generate auth challenge and verify
         let reply = RegisterResponse {
             auth_challenge: Vec::new(),
         };
@@ -314,6 +498,20 @@ fn insert_one_time_key(
         params![user_id, prekey.kind, prekey.key, prekey.signature],
     )?;
     Ok(())
+}
+
+fn insert_one_time_keys(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    user_id: i64,
+    prekeys: Vec<SignedPrekey>,
+) -> Result<i32, RusqliteError> {
+    let mut count = 0;
+    for prekey in prekeys {
+        insert_one_time_key(tx, table, user_id, &prekey)?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 fn take_one_time_key(
@@ -415,6 +613,45 @@ async fn init_db(conn: &Connection) -> Result<(), TokioRusqliteError<RusqliteErr
 }
 
 #[cfg(test)]
+impl ServerStore {
+    async fn count_users_and_prekeys(&self) -> Result<(i64, i64), Status> {
+        let db = Arc::clone(&self.db);
+        let counts = db
+            .call(|conn| {
+                let user_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+                let prekey_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM one_time_prekeys", [], |row| {
+                        row.get(0)
+                    })?;
+                Ok::<(i64, i64), RusqliteError>((user_count, prekey_count))
+            })
+            .await
+            .map_err(map_db_error)?;
+        Ok(counts)
+    }
+
+    async fn count_one_time_keys(&self) -> Result<(i64, i64), Status> {
+        let db = Arc::clone(&self.db);
+        let counts = db
+            .call(|conn| {
+                let prekey_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM one_time_prekeys", [], |row| {
+                        row.get(0)
+                    })?;
+                let kem_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM one_time_kem_keys", [], |row| {
+                        row.get(0)
+                    })?;
+                Ok::<(i64, i64), RusqliteError>((prekey_count, kem_count))
+            })
+            .await
+            .map_err(map_db_error)?;
+        Ok(counts)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use newspeak::KeyKind;
@@ -431,9 +668,10 @@ mod tests {
     async fn test_service() -> NewspeakService {
         let db = Connection::open(":memory:").await.unwrap();
         init_db(&db).await.unwrap();
+        let db = Arc::new(db);
         NewspeakService {
-            db: Arc::new(db),
             users: Arc::new(Mutex::new(HashMap::new())),
+            server_store: ServerStore::new(db),
         }
     }
 
@@ -451,20 +689,7 @@ mod tests {
         let response = svc.register(Request::new(request)).await.unwrap();
         assert!(response.into_inner().auth_challenge.is_empty());
 
-        let counts = svc
-            .db
-            .call(|conn| {
-                let user_count: i64 =
-                    conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
-                let prekey_count: i64 =
-                    conn.query_row("SELECT COUNT(*) FROM one_time_prekeys", [], |row| {
-                        row.get(0)
-                    })?;
-                Ok::<(i64, i64), RusqliteError>((user_count, prekey_count))
-            })
-            .await
-            .unwrap();
-
+        let counts = svc.server_store.count_users_and_prekeys().await.unwrap();
         assert_eq!(counts, (1, 1));
     }
 
@@ -498,18 +723,14 @@ mod tests {
         svc.register(Request::new(request)).await.unwrap();
 
         let kem_prekey = sample_prekey(KeyKind::MlKem1024, &[8], &[9]);
-        svc.db
-            .call(move |conn| {
-                let tx = conn.transaction()?;
-                let user_id: i64 = tx.query_row(
-                    "SELECT id FROM users WHERE username = ?1",
-                    params!["carol"],
-                    |row| row.get(0),
-                )?;
-                insert_one_time_key(&tx, "one_time_kem_keys", user_id, &kem_prekey)?;
-                tx.commit()?;
-                Ok::<(), RusqliteError>(())
-            })
+        let user = svc
+            .server_store
+            .get_user("carol".to_string())
+            .await
+            .unwrap();
+        let user_id = user.id.unwrap();
+        svc.server_store
+            .add_one_time_prekeys(user_id, Vec::new(), vec![kem_prekey])
             .await
             .unwrap();
 
@@ -526,21 +747,7 @@ mod tests {
         assert_eq!(bundle.kem_encap_key.unwrap().key, vec![8]);
         assert_eq!(bundle.one_time_prekey.unwrap().key, vec![4]);
 
-        let counts = svc
-            .db
-            .call(|conn| {
-                let prekey_count: i64 =
-                    conn.query_row("SELECT COUNT(*) FROM one_time_prekeys", [], |row| {
-                        row.get(0)
-                    })?;
-                let kem_count: i64 =
-                    conn.query_row("SELECT COUNT(*) FROM one_time_kem_keys", [], |row| {
-                        row.get(0)
-                    })?;
-                Ok::<(i64, i64), RusqliteError>((prekey_count, kem_count))
-            })
-            .await
-            .unwrap();
+        let counts = svc.server_store.count_one_time_keys().await.unwrap();
 
         assert_eq!(counts, (0, 0));
     }
@@ -551,9 +758,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:10000".parse()?;
     let db = Connection::open("newspeak.db").await?;
     init_db(&db).await?;
+    let db = Arc::new(db);
     let svc = NewspeakService {
-        db: Arc::new(db),
         users: Arc::new(Mutex::new(HashMap::new())),
+        server_store: ServerStore::new(db),
     };
 
     println!("NewspeakServer listening on {}", addr);
