@@ -21,6 +21,7 @@ use crate::{
 use anyhow::{Result, anyhow};
 use ed25519_dalek as ed25519;
 use ml_kem::{Encoded, EncodedSizeUser, MlKem1024Params, kem::EncapsulationKey};
+use std::io::Write;
 use std::sync::Arc;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, mpsc};
@@ -235,6 +236,17 @@ fn format_server_message(message: ServerMessage) -> String {
     }
 }
 
+fn print_prompt() {
+    print!("> ");
+    let _ = std::io::stdout().flush();
+}
+
+fn print_incoming(message: &str) {
+    print!("\r\x1b[2K");
+    println!("{}", message);
+    print_prompt();
+}
+
 fn ratchet_message_to_proto(message: RatchetMessage) -> ProtoRatchetMessage {
     ProtoRatchetMessage {
         public_key: message.header.pk.as_bytes().to_vec(),
@@ -302,7 +314,7 @@ async fn main() -> Result<()> {
     user.register().await?;
 
     println!("listening for input (press Ctrl+C to quit)...");
-    print!("> ");
+    print_prompt();
 
     let (tx, rx) = mpsc::channel(32);
     let response = user
@@ -346,9 +358,8 @@ async fn main() -> Result<()> {
             match message {
                 Ok(server_message) => match server_message.message_type {
                     Some(server_message::MessageType::JoinResponse(_)) => {
-                        println!();
-                        println!("{}", format_server_message(server_message));
-                        print!("> ");
+                        let message = format_server_message(server_message);
+                        print_incoming(&message);
                     }
                     Some(server_message::MessageType::KeyExchange(message)) => {
                         let Some(init_message) = message.initial_message.as_ref() else {
@@ -389,9 +400,10 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        println!();
-                        println!("key exchange completed with {}", message.sender_id);
-                        print!("> ");
+                        print_incoming(&format!(
+                            "key exchange completed with {}",
+                            message.sender_id
+                        ));
                     }
                     Some(server_message::MessageType::Encrypted(message)) => {
                         let Some(inner) = message.ratchet_message else {
@@ -417,7 +429,11 @@ async fn main() -> Result<()> {
                         if let Some(ratchet) = guard.as_mut() {
                             match ratchet.receive_message(ratchet_message, RATCHET_AD) {
                                 Ok(plaintext) => {
-                                    println!("< received [{}]: {}", ratchet.receiving_counter - 1, plaintext);
+                                    print_incoming(&format!(
+                                        "< received [{}]: {}",
+                                        ratchet.receiving_counter - 1,
+                                        plaintext
+                                    ));
                                     if let Err(err) = storage_inbound
                                         .add_message(&username_inbound, &message.sender_id, &plaintext, false)
                                         .await
@@ -430,7 +446,6 @@ async fn main() -> Result<()> {
                                     {
                                         eprintln!("failed to update conversation: {}", err);
                                     }
-                                    print!("> ");
                                 }
                                 Err(err) => {
                                     println!("failed to receive mesesage: {}", err.to_string());
@@ -458,6 +473,7 @@ async fn main() -> Result<()> {
         }
 
         if line == "" {
+            print_prompt();
             continue;
         }
 
@@ -478,6 +494,7 @@ async fn main() -> Result<()> {
             })
             .await?;
 
+            print_prompt();
             continue;
         }
 
@@ -512,7 +529,7 @@ async fn main() -> Result<()> {
         } else {
             println!("you need to init the key exchange");
         }
-        print!("> ");
+        print_prompt();
     }
 
     Ok(())

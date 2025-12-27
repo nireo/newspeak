@@ -886,9 +886,7 @@ mod tests {
         alice.as_initiator(shared_key, bob.sending_pk);
         let _ = alice.send_message("hello", b"ratchet-ad")?;
 
-        storage
-            .update_conversation("alice", "bob", &alice)
-            .await?;
+        storage.update_conversation("alice", "bob", &alice).await?;
         let loaded = storage.get_conversation("alice", "bob").await?;
         let loaded = loaded.expect("conversation");
 
@@ -917,14 +915,10 @@ mod tests {
         let mut alice = RatchetState::new();
         let bob = RatchetState::new();
         alice.as_initiator(shared_key, bob.sending_pk);
-        storage
-            .update_conversation("alice", "bob", &alice)
-            .await?;
+        storage.update_conversation("alice", "bob", &alice).await?;
 
         let _ = alice.send_message("hello", b"ratchet-ad")?;
-        storage
-            .update_conversation("alice", "bob", &alice)
-            .await?;
+        storage.update_conversation("alice", "bob", &alice).await?;
         let loaded = storage
             .get_conversation("alice", "bob")
             .await?
@@ -946,13 +940,9 @@ mod tests {
         let mut alice = RatchetState::new();
         let bob = RatchetState::new();
         alice.as_initiator(shared_key, bob.sending_pk);
-        storage
-            .update_conversation("alice", "bob", &alice)
-            .await?;
+        storage.update_conversation("alice", "bob", &alice).await?;
 
-        storage
-            .add_message("alice", "bob", "hi bob", true)
-            .await?;
+        storage.add_message("alice", "bob", "hi bob", true).await?;
         storage
             .add_message("alice", "bob", "hi alice", false)
             .await?;
