@@ -139,27 +139,42 @@ impl LocalStorage {
         Ok(())
     }
 
-    async fn insert_kem_key(
+    async fn insert_kem_keys(
         &self,
         username: &str,
-        id: pqxdh::KemId,
-        key: &pqxdh::SignedMlKemPrekey,
+        keys: &pqxdh::KeyStore<pqxdh::KemId, pqxdh::SignedMlKemPrekey>,
     ) -> Result<()> {
-        let key_bytes = key.decap_key.as_bytes().as_slice().to_vec();
+        if keys.len() == 0 {
+            return Ok(());
+        }
+        let rows: Vec<(pqxdh::KemId, Vec<u8>, i64)> = keys
+            .iter()
+            .map(|(id, key, used)| {
+                (
+                    *id,
+                    key.decap_key.as_bytes().as_slice().to_vec(),
+                    if used { 1 } else { 0 },
+                )
+            })
+            .collect();
         let db = Arc::clone(&self.db);
         let username = username.to_string();
 
         db.call(move |conn| {
             let tx = conn.transaction()?;
-            tx.execute(
-                "INSERT INTO kem_keys (
-                    id,
-                    username,
-                    decap,
-                    used
-                ) VALUES (?1, ?2, ?3, ?4)",
-                params![id, username, key_bytes, 0],
-            )?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO kem_keys (
+                        id,
+                        username,
+                        decap,
+                        used
+                    ) VALUES (?1, ?2, ?3, ?4)",
+                )?;
+                for (id, key_bytes, used) in rows {
+                    stmt.execute(params![id, &username, key_bytes, used])?;
+                }
+            }
             tx.commit()?;
             Ok::<(), RusqliteError>(())
         })
@@ -169,27 +184,42 @@ impl LocalStorage {
         Ok(())
     }
 
-    async fn insert_ec_key(
+    async fn insert_ec_keys(
         &self,
         username: &str,
-        id: u32,
-        key: &pqxdh::SignedPrekey,
+        keys: &pqxdh::KeyStore<u32, pqxdh::SignedPrekey>,
     ) -> Result<()> {
-        let key_bytes = key.private_key.as_bytes().to_vec();
+        if keys.len() == 0 {
+            return Ok(());
+        }
+        let rows: Vec<(u32, Vec<u8>, i64)> = keys
+            .iter()
+            .map(|(id, key, used)| {
+                (
+                    *id,
+                    key.private_key.as_bytes().to_vec(),
+                    if used { 1 } else { 0 },
+                )
+            })
+            .collect();
         let db = Arc::clone(&self.db);
         let username = username.to_string();
 
         db.call(move |conn| {
             let tx = conn.transaction()?;
-            tx.execute(
-                "INSERT INTO ec_keys (
-                    id,
-                    username,
-                    sk,
-                    used
-                ) VALUES (?1, ?2, ?3, ?4)",
-                params![id, username, key_bytes, 0],
-            )?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO ec_keys (
+                        id,
+                        username,
+                        sk,
+                        used
+                    ) VALUES (?1, ?2, ?3, ?4)",
+                )?;
+                for (id, key_bytes, used) in rows {
+                    stmt.execute(params![id, &username, key_bytes, used])?;
+                }
+            }
             tx.commit()?;
             Ok::<(), RusqliteError>(())
         })
@@ -729,44 +759,57 @@ mod tests {
 
         let mut rng = rand::thread_rng();
         let mut identity_sk = user.identity_sk.clone();
-        let ec_key = pqxdh::SignedPrekey::new(&mut rng, &mut identity_sk);
-        let kem_key = pqxdh::SignedMlKemPrekey::new(&mut rng, &mut identity_sk);
-        let ec_id = 7u32;
-        let kem_id: KemId = rand::random();
+        let ec_key_used = pqxdh::SignedPrekey::new(&mut rng, &mut identity_sk);
+        let ec_key_unused = pqxdh::SignedPrekey::new(&mut rng, &mut identity_sk);
+        let kem_key_used = pqxdh::SignedMlKemPrekey::new(&mut rng, &mut identity_sk);
+        let kem_key_unused = pqxdh::SignedMlKemPrekey::new(&mut rng, &mut identity_sk);
+        let ec_id_used = 7u32;
+        let ec_id_unused = 9u32;
+        let kem_id_used: KemId = rand::random();
+        let kem_id_unused: KemId = rand::random();
 
-        storage.insert_ec_key("alice", ec_id, &ec_key).await?;
-        storage.insert_kem_key("alice", kem_id, &kem_key).await?;
+        let mut ec_store = pqxdh::KeyStore::new();
+        ec_store.insert(ec_id_used, ec_key_used.clone());
+        ec_store.insert(ec_id_unused, ec_key_unused.clone());
+        ec_store.mark_used(&ec_id_used);
 
-        let db = Arc::clone(&storage.db);
-        let kem_id_bytes = kem_id.to_vec();
-        db.call(move |conn| {
-            conn.execute("UPDATE ec_keys SET used = 1 WHERE id = ?1", params![ec_id])?;
-            conn.execute(
-                "UPDATE kem_keys SET used = 1 WHERE id = ?1",
-                params![kem_id_bytes],
-            )?;
-            Ok::<(), RusqliteError>(())
-        })
-        .await
-        .map_err(|err| anyhow!(err))?;
+        let mut kem_store = pqxdh::KeyStore::new();
+        kem_store.insert(kem_id_used, kem_key_used.clone());
+        kem_store.insert(kem_id_unused, kem_key_unused.clone());
+        kem_store.mark_used(&kem_id_used);
+
+        storage.insert_ec_keys("alice", &ec_store).await?;
+        storage.insert_kem_keys("alice", &kem_store).await?;
 
         let ec_keys = storage.get_user_ec_keys("alice").await?;
         let kem_keys = storage.get_user_kem_keys("alice").await?;
 
-        assert_eq!(ec_keys.len(), 1);
-        assert_eq!(kem_keys.len(), 1);
-        assert_eq!(ec_keys.is_used(&ec_id), Some(true));
-        assert_eq!(kem_keys.is_used(&kem_id), Some(true));
+        assert_eq!(ec_keys.len(), 2);
+        assert_eq!(kem_keys.len(), 2);
+        assert_eq!(ec_keys.is_used(&ec_id_used), Some(true));
+        assert_eq!(ec_keys.is_used(&ec_id_unused), Some(false));
+        assert_eq!(kem_keys.is_used(&kem_id_used), Some(true));
+        assert_eq!(kem_keys.is_used(&kem_id_unused), Some(false));
 
-        let ec_loaded = ec_keys.get(&ec_id).expect("ec key");
+        let ec_loaded = ec_keys.get(&ec_id_used).expect("ec key");
         assert_eq!(
             ec_loaded.public_key.as_bytes(),
-            ec_key.public_key.as_bytes()
+            ec_key_used.public_key.as_bytes()
         );
-        let kem_loaded = kem_keys.get(&kem_id).expect("kem key");
+        let ec_loaded = ec_keys.get(&ec_id_unused).expect("ec key");
+        assert_eq!(
+            ec_loaded.public_key.as_bytes(),
+            ec_key_unused.public_key.as_bytes()
+        );
+        let kem_loaded = kem_keys.get(&kem_id_used).expect("kem key");
         assert_eq!(
             kem_loaded.encap_key.as_bytes(),
-            kem_key.encap_key.as_bytes()
+            kem_key_used.encap_key.as_bytes()
+        );
+        let kem_loaded = kem_keys.get(&kem_id_unused).expect("kem key");
+        assert_eq!(
+            kem_loaded.encap_key.as_bytes(),
+            kem_key_unused.encap_key.as_bytes()
         );
 
         Ok(())

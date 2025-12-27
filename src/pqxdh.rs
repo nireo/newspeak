@@ -91,6 +91,12 @@ impl<I: Hash + Eq, T: Clone> KeyStore<I, T> {
     pub fn first_unused(&self) -> Option<(&I, &OneTimeKey<T>)> {
         self.store.iter().find(|k| !k.1.used)
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&I, &T, bool)> {
+        self.store
+            .iter()
+            .map(|(id, entry)| (id, &entry.key, entry.used))
+    }
 }
 
 #[derive(Clone)]
