@@ -13,6 +13,7 @@ use crate::pqxdh;
 use crate::pqxdh::KemId;
 use crate::pqxdh::KeyStore;
 use crate::pqxdh::SignedMlKemPrekey;
+use crate::pqxdh::SignedPrekey;
 use crate::ratchet::RatchetState;
 
 pub struct ConversationMessage {
@@ -29,6 +30,8 @@ struct StoredUser {
     identity_sk: [u8; 32],
     signed_prekey_sk: [u8; 32],
     kem_decap: Vec<u8>,
+    kem_store: Option<KeyStore<KemId, SignedMlKemPrekey>>,
+    ec_store: Option<KeyStore<u32, SignedPrekey>>,
 }
 
 impl LocalStorage {
@@ -53,22 +56,7 @@ impl LocalStorage {
             return stored_user_to_key_exchange_user(stored);
         }
 
-        let mut rng = rand::thread_rng();
-        let mut identity_sk = ed25519_dalek::SigningKey::generate(&mut rng);
-        let identity_pk = identity_sk.verifying_key();
-        let signed_prekey = pqxdh::SignedPrekey::new(&mut rng, &mut identity_sk);
-        let last_resort_kem = pqxdh::SignedMlKemPrekey::new(&mut rng, &mut identity_sk);
-
-        let user = pqxdh::KeyExchangeUser {
-            identity_sk,
-            identity_pk,
-            signed_prekey,
-            last_resort_kem,
-            last_resort_id: rand::random(),
-            one_time_keys: pqxdh::KeyStore::new(),
-            one_time_kem_keys: pqxdh::KeyStore::new(),
-            one_time_prekey_id: 0,
-        };
+        let user = pqxdh::KeyExchangeUser::new();
 
         self.insert_user(username, &user).await?;
         Ok(user)
@@ -76,14 +64,14 @@ impl LocalStorage {
 
     async fn load_user(&self, username: &str) -> Result<Option<StoredUser>> {
         let db = Arc::clone(&self.db);
-        let username = username.to_string();
+        let username_owned = username.to_string();
         let row = db
             .call(move |conn| {
                 conn.query_row(
                     "SELECT identity_sk, signed_prekey_sk, kem_decap
                      FROM local_users
                      WHERE username = ?1",
-                    params![username],
+                    params![username_owned],
                     |row| {
                         let identity_sk: Vec<u8> = row.get(0)?;
                         let signed_prekey_sk: Vec<u8> = row.get(1)?;
@@ -100,11 +88,43 @@ impl LocalStorage {
             return Ok(None);
         };
 
+        let kem_store = self.get_user_kem_keys(username).await?;
+        let ec_store = self.get_user_ec_keys(username).await?;
+
         Ok(Some(StoredUser {
             identity_sk: bytes_to_32(&identity_sk)?,
             signed_prekey_sk: bytes_to_32(&signed_prekey_sk)?,
             kem_decap,
+            kem_store: Some(kem_store),
+            ec_store: Some(ec_store),
         }))
+    }
+
+    async fn load_identity_sk(&self, username: &str) -> Result<Option<[u8; 32]>> {
+        let db = Arc::clone(&self.db);
+        let username = username.to_string();
+        let row = db
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT identity_sk
+                     FROM local_users
+                     WHERE username = ?1",
+                    params![username],
+                    |row| {
+                        let identity_sk: Vec<u8> = row.get(0)?;
+                        Ok(identity_sk)
+                    },
+                )
+                .optional()
+            })
+            .await
+            .map_err(|err| anyhow!(err))?;
+
+        let Some(identity_sk) = row else {
+            return Ok(None);
+        };
+
+        Ok(Some(bytes_to_32(&identity_sk)?))
     }
 
     async fn insert_user(&self, username: &str, user: &pqxdh::KeyExchangeUser) -> Result<()> {
@@ -117,7 +137,7 @@ impl LocalStorage {
             .as_slice()
             .to_vec();
         let db = Arc::clone(&self.db);
-        let username = username.to_string();
+        let username_owned = username.to_string();
 
         db.call(move |conn| {
             let tx = conn.transaction()?;
@@ -128,13 +148,17 @@ impl LocalStorage {
                     signed_prekey_sk,
                     kem_decap
                 ) VALUES (?1, ?2, ?3, ?4)",
-                params![username, identity_sk, signed_prekey_sk, kem_decap],
+                params![username_owned, identity_sk, signed_prekey_sk, kem_decap],
             )?;
             tx.commit()?;
             Ok::<(), RusqliteError>(())
         })
         .await
         .map_err(|err| anyhow!(err))?;
+
+        self.insert_kem_keys(&username, &user.one_time_kem_keys)
+            .await?;
+        self.insert_ec_keys(&username, &user.one_time_keys).await?;
 
         Ok(())
     }
@@ -234,10 +258,10 @@ impl LocalStorage {
         username: &str,
     ) -> Result<KeyStore<KemId, SignedMlKemPrekey>> {
         let mut key_store = KeyStore::new();
-        let Some(stored) = self.load_user(username).await? else {
+        let Some(identity_sk_bytes) = self.load_identity_sk(username).await? else {
             return Ok(key_store);
         };
-        let identity_sk = ed25519_dalek::SigningKey::from_bytes(&stored.identity_sk);
+        let identity_sk = ed25519_dalek::SigningKey::from_bytes(&identity_sk_bytes);
         let db = Arc::clone(&self.db);
         let username = username.to_string();
         let rows = db
@@ -288,10 +312,10 @@ impl LocalStorage {
         username: &str,
     ) -> Result<KeyStore<u32, pqxdh::SignedPrekey>> {
         let mut key_store = KeyStore::new();
-        let Some(stored) = self.load_user(username).await? else {
+        let Some(identity_sk_bytes) = self.load_identity_sk(username).await? else {
             return Ok(key_store);
         };
-        let identity_sk = ed25519_dalek::SigningKey::from_bytes(&stored.identity_sk);
+        let identity_sk = ed25519_dalek::SigningKey::from_bytes(&identity_sk_bytes);
         let db = Arc::clone(&self.db);
         let username = username.to_string();
         let rows = db
@@ -631,15 +655,24 @@ fn stored_user_to_key_exchange_user(stored: StoredUser) -> Result<pqxdh::KeyExch
         signature: kem_sig,
     };
 
+    let one_time_keys = stored.ec_store.unwrap_or_else(pqxdh::KeyStore::new);
+    let one_time_kem_keys = stored.kem_store.unwrap_or_else(pqxdh::KeyStore::new);
+    let one_time_prekey_id = one_time_keys
+        .iter()
+        .map(|(id, _, _)| *id)
+        .max()
+        .map(|id| id.saturating_add(1))
+        .unwrap_or(0);
+
     Ok(pqxdh::KeyExchangeUser {
         identity_sk,
         identity_pk,
         signed_prekey,
         last_resort_kem,
         last_resort_id: rand::random(),
-        one_time_keys: pqxdh::KeyStore::new(),
-        one_time_kem_keys: pqxdh::KeyStore::new(),
-        one_time_prekey_id: 0,
+        one_time_keys,
+        one_time_kem_keys,
+        one_time_prekey_id,
     })
 }
 
@@ -755,7 +788,11 @@ mod tests {
     async fn local_storage_loads_one_time_keys() -> Result<()> {
         let db = TempDb::new();
         let storage = LocalStorage::new_with_path(&db.path).await?;
-        let user = storage.load_or_create_user("alice").await?;
+        let mut user = pqxdh::KeyExchangeUser::new();
+        user.one_time_keys = pqxdh::KeyStore::new();
+        user.one_time_kem_keys = pqxdh::KeyStore::new();
+        user.one_time_prekey_id = 0;
+        storage.insert_user("alice", &user).await?;
 
         let mut rng = rand::thread_rng();
         let mut identity_sk = user.identity_sk.clone();

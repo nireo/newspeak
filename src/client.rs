@@ -8,9 +8,10 @@ pub mod newspeak {
 use crate::{
     local_store::LocalStorage,
     newspeak::{
-        ClientMessage, EncryptedMessage, FetchPrekeyBundleRequest, InitialMessage, JoinRequest,
-        KeyKind, RatchetMessage as ProtoRatchetMessage, RegisterRequest, ServerMessage,
-        client_message, newspeak_client::NewspeakClient, server_message,
+        AddSignedPrekeysRequest, ClientMessage, EncryptedMessage, FetchPrekeyBundleRequest,
+        InitialMessage, JoinRequest, KeyKind, RatchetMessage as ProtoRatchetMessage,
+        RegisterRequest, ServerMessage, client_message, newspeak_client::NewspeakClient,
+        server_message,
     },
     pqxdh::{
         KeyExchangeUser, PQXDHInitMessage, PrekeyBundle, PublicSignedMlKemPrekey,
@@ -69,16 +70,55 @@ impl<'a> User<'a> {
     }
 
     pub async fn register(&mut self) -> Result<()> {
-        let key_info = self.key_info.lock().await;
+        let (identity_key, signed_prekey, kem_prekey, one_time_prekeys, kem_prekeys) = {
+            let key_info = self.key_info.lock().await;
+            let one_time_prekeys = key_info
+                .one_time_keys
+                .iter()
+                .filter_map(|(_, key, used)| {
+                    if used {
+                        None
+                    } else {
+                        Some(key.into())
+                    }
+                })
+                .collect::<Vec<_>>();
+            let kem_prekeys = key_info
+                .one_time_kem_keys
+                .iter()
+                .filter_map(|(_, key, used)| {
+                    if used {
+                        None
+                    } else {
+                        Some(key.into())
+                    }
+                })
+                .collect::<Vec<_>>();
+            (
+                key_info.identity_pk.as_bytes().to_vec(),
+                (&key_info.signed_prekey).into(),
+                (&key_info.last_resort_kem).into(),
+                one_time_prekeys,
+                kem_prekeys,
+            )
+        };
         let req = RegisterRequest {
             username: self.username.into(),
-            identity_key: key_info.identity_pk.as_bytes().to_vec(),
-            signed_prekey: Some((&key_info.signed_prekey).into()),
-            one_time_prekeys: vec![],
-            kem_prekey: Some((&key_info.last_resort_kem).into()),
+            identity_key,
+            signed_prekey: Some(signed_prekey),
+            one_time_prekeys,
+            kem_prekey: Some(kem_prekey),
         };
 
         self.client.register(req).await?;
+        if !kem_prekeys.is_empty() {
+            self.client
+                .add_signed_prekeys(AddSignedPrekeysRequest {
+                    keys: kem_prekeys,
+                    username: self.username.into(),
+                })
+                .await?;
+        }
         Ok(())
     }
 
