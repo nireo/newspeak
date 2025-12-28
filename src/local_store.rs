@@ -524,6 +524,32 @@ impl LocalStorage {
         Ok(row)
     }
 
+    pub async fn get_user_conversations(&self, username: &str) -> Result<Vec<String>> {
+        let db = Arc::clone(&self.db);
+        let username = username.to_string();
+        let rows = db
+            .call(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT peer
+                     FROM conversations
+                     WHERE username = ?1",
+                )?;
+                let rows = stmt.query_map(params![username], |row| {
+                    let peer: String = row.get(0)?;
+                    Ok(peer)
+                })?;
+                let mut results = Vec::new();
+                for row in rows {
+                    results.push(row?);
+                }
+                Ok::<_, RusqliteError>(results)
+            })
+            .await
+            .map_err(|err| anyhow!(err))?;
+
+        Ok(rows)
+    }
+
     async fn init_migrations(conn: &Connection) -> Result<(), TokioRusqliteError<RusqliteError>> {
         // some thoughts on the schema: for a relational format it makes more sense to store the
         // user like this, overall sqlite is very reliable and a good also for internal storage in
@@ -564,41 +590,8 @@ impl LocalStorage {
                 );",
             )?;
 
-            let has_conversations: Option<String> = conn
-                .query_row(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'conversations'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()?;
-
-            if has_conversations.is_some() {
-                let mut stmt = conn.prepare("PRAGMA table_info(conversations)")?;
-                let columns = stmt
-                    .query_map([], |row| {
-                        let name: String = row.get(1)?;
-                        Ok(name)
-                    })?
-                    .collect::<Result<Vec<String>, RusqliteError>>()?;
-                if !columns.iter().any(|name| name == "id") {
-                    conn.execute_batch(
-                        "ALTER TABLE conversations RENAME TO conversations_old;
-                        CREATE TABLE conversations(
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            username TEXT NOT NULL,
-                            peer TEXT NOT NULL,
-                            ratchet_state BLOB NOT NULL,
-                            UNIQUE (username, peer),
-                            FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
-                        );
-                        INSERT INTO conversations (username, peer, ratchet_state)
-                            SELECT username, peer, ratchet_state FROM conversations_old;
-                        DROP TABLE conversations_old;",
-                    )?;
-                }
-            } else {
-                conn.execute_batch(
-                    "CREATE TABLE conversations(
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS conversations(
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         username TEXT NOT NULL,
                         peer TEXT NOT NULL,
@@ -606,8 +599,7 @@ impl LocalStorage {
                         UNIQUE (username, peer),
                         FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
                     );",
-                )?;
-            }
+            )?;
 
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS messages(
@@ -990,6 +982,33 @@ mod tests {
         assert!(messages[0].is_sender);
         assert_eq!(messages[1].content, "hi alice");
         assert!(!messages[1].is_sender);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_user_conversations_lists_peers() -> Result<()> {
+        let db = TempDb::new();
+        let storage = LocalStorage::new_with_path(&db.path).await?;
+        storage.load_or_create_user("alice").await?;
+
+        let shared_key: [u8; 32] = rand::random();
+        let mut alice = RatchetState::new();
+        let bob = RatchetState::new();
+        alice.as_initiator(shared_key, bob.sending_pk);
+        storage.update_conversation("alice", "bob", &alice).await?;
+
+        let mut alice2 = RatchetState::new();
+        let charlie = RatchetState::new();
+        alice2.as_initiator(shared_key, charlie.sending_pk);
+        storage
+            .update_conversation("alice", "charlie", &alice2)
+            .await?;
+
+        let peers = storage.get_user_conversations("alice").await?;
+        assert_eq!(peers.len(), 2);
+        assert!(peers.contains(&"bob".to_string()));
+        assert!(peers.contains(&"charlie".to_string()));
 
         Ok(())
     }

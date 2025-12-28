@@ -3,7 +3,7 @@ pub mod newspeak {
 }
 
 use blake3;
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{VerifyingKey, ed25519};
 use newspeak::newspeak_server::{Newspeak, NewspeakServer};
 use newspeak::{
     FetchPrekeyBundleRequest, FetchPrekeyBundleResponse, PrekeyBundle, RegisterRequest,
@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
+use tokio::time::{self, Duration, Instant};
 use tokio_rusqlite::Connection;
 use tokio_rusqlite::Error as TokioRusqliteError;
 use tokio_rusqlite::rusqlite::{self, Error as RusqliteError, OptionalExtension, params};
@@ -26,9 +27,95 @@ use crate::newspeak::{
 };
 
 #[derive(Clone)]
+struct AuthChallenge {
+    created_at: time::Instant,
+    data: [u8; 32],
+}
+
+const AUTH_CHALLENGE_TTL: Duration = Duration::from_secs(300);
+
+#[derive(Clone)]
 struct NewspeakService {
     users: Arc<Mutex<HashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>>,
     server_store: ServerStore,
+
+    // auth_challenges are returned on registeration and to successfully join a stream the handler
+    // the client must return a signature for the challenge signed with their longterm identity
+    // key.
+    auth_challenges: Arc<Mutex<HashMap<String, AuthChallenge>>>,
+}
+
+impl NewspeakService {
+    async fn purge_expired_auth_challenges(&self) {
+        let challenges = Arc::clone(&self.auth_challenges);
+        let mut guard = challenges.lock().await;
+        guard.retain(|_, challenge| challenge.created_at.elapsed() <= AUTH_CHALLENGE_TTL);
+    }
+
+    async fn create_auth_challenge(&self, username: String) -> AuthChallenge {
+        self.purge_expired_auth_challenges().await;
+        let data: [u8; 32] = rand::random();
+        let now = Instant::now();
+
+        let challenge = AuthChallenge {
+            created_at: now,
+            data,
+        };
+
+        let challenges = Arc::clone(&self.auth_challenges);
+        let mut guard = challenges.lock().await;
+        guard.insert(username, challenge.clone());
+
+        challenge
+    }
+
+    async fn verify_auth_challenge(
+        &self,
+        username: String,
+        signature: ed25519::Signature,
+    ) -> Result<(), Status> {
+        let challenges = Arc::clone(&self.auth_challenges);
+        let chall = {
+            let mut guard = challenges.lock().await;
+            let chall = guard.get(&username).cloned();
+            match chall {
+                Some(chall) => {
+                    if chall.created_at.elapsed() > AUTH_CHALLENGE_TTL {
+                        guard.remove(&username);
+                        return Err(Status::unauthenticated("auth challenge expired"));
+                    }
+                    chall
+                }
+                None => {
+                    return Err(Status::not_found(
+                        "auth challenge not found for user, register to generate new one",
+                    ));
+                }
+            }
+        };
+
+        let user = self.server_store.get_user(username.clone()).await?;
+        let identity_key_bytes: [u8; 32] =
+            user.identity_key.as_slice().try_into().map_err(|_| {
+                Status::internal("stored identity key has invalid length, database corrupted")
+            })?;
+
+        // we need to verify that the identity_key matches
+        let identity_pk = VerifyingKey::from_bytes(&identity_key_bytes)
+            .map_err(|_| Status::internal("stored identity key is invalid, database corrupted"))?;
+
+        identity_pk
+            .verify_strict(&chall.data, &signature)
+            .map_err(|_| Status::invalid_argument("signature provided is invalid"))?;
+
+        let mut guard = challenges.lock().await;
+        guard.remove(&username);
+        drop(guard);
+
+        self.purge_expired_auth_challenges().await;
+
+        Ok(())
+    }
 }
 
 struct StoredPrekey {
@@ -88,7 +175,6 @@ impl ServerStore {
             for prekey in user.one_time_prekeys {
                 insert_one_time_key(&tx, "one_time_prekeys", user_id, &prekey)?;
             }
-
             tx.commit()?;
             Ok(())
         })
@@ -298,6 +384,7 @@ impl Newspeak for NewspeakService {
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(32);
         let users = Arc::clone(&self.users);
+        let service = self.clone();
 
         tokio::spawn(async move {
             let mut active_username: Option<String> = None;
@@ -309,6 +396,30 @@ impl Newspeak for NewspeakService {
                                 let _ = tx
                                     .send(Err(Status::invalid_argument("username is required")))
                                     .await;
+                                continue;
+                            }
+
+                            let signature_bytes: [u8; 64] = match join_request
+                                .signature
+                                .as_slice()
+                                .try_into()
+                            {
+                                Ok(bytes) => bytes,
+                                Err(_) => {
+                                    let _ = tx
+                                        .send(Err(Status::unauthenticated(
+                                            "invalid auth signature length",
+                                        )))
+                                        .await;
+                                    continue;
+                                }
+                            };
+                            let signature = ed25519::Signature::from_bytes(&signature_bytes);
+                            if let Err(err) = service
+                                .verify_auth_challenge(join_request.username.clone(), signature)
+                                .await
+                            {
+                                let _ = tx.send(Err(err)).await;
                                 continue;
                             }
 
@@ -456,6 +567,7 @@ impl Newspeak for NewspeakService {
             .ok_or_else(|| Status::invalid_argument("kem_prekey is required"))?;
 
         let username = request.username;
+        let challenge_username = username.clone();
         let identity_key = request.identity_key;
         let one_time_prekeys = request.one_time_prekeys;
 
@@ -469,9 +581,9 @@ impl Newspeak for NewspeakService {
         };
         self.server_store.insert_user(server_user).await?;
 
-        // TODO: generate auth challenge and verify
+        let challenge = self.create_auth_challenge(challenge_username).await;
         let reply = RegisterResponse {
-            auth_challenge: Vec::new(),
+            auth_challenge: challenge.data.to_vec(),
         };
         Ok(Response::new(reply))
     }
@@ -655,6 +767,7 @@ impl ServerStore {
 mod tests {
     use super::*;
     use newspeak::KeyKind;
+    use ed25519_dalek::{Signer, SigningKey};
     use tonic::Code;
 
     fn sample_prekey(kind: KeyKind, key: &[u8], signature: &[u8]) -> SignedPrekey {
@@ -672,6 +785,7 @@ mod tests {
         NewspeakService {
             users: Arc::new(Mutex::new(HashMap::new())),
             server_store: ServerStore::new(db),
+            auth_challenges: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -687,7 +801,7 @@ mod tests {
         };
 
         let response = svc.register(Request::new(request)).await.unwrap();
-        assert!(response.into_inner().auth_challenge.is_empty());
+        assert_eq!(response.into_inner().auth_challenge.len(), 32);
 
         let counts = svc.server_store.count_users_and_prekeys().await.unwrap();
         assert_eq!(counts, (1, 1));
@@ -751,6 +865,76 @@ mod tests {
 
         assert_eq!(counts, (0, 0));
     }
+
+    #[tokio::test]
+    async fn auth_challenge_verifies_and_is_single_use() {
+        let svc = test_service().await;
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let request = RegisterRequest {
+            username: "dave".to_string(),
+            identity_key: signing_key.verifying_key().to_bytes().to_vec(),
+            signed_prekey: Some(sample_prekey(KeyKind::X25519, &[1], &[2])),
+            one_time_prekeys: vec![],
+            kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[3], &[4])),
+        };
+
+        let response = svc.register(Request::new(request)).await.unwrap();
+        let challenge: [u8; 32] = response
+            .into_inner()
+            .auth_challenge
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let signature = signing_key.sign(&challenge);
+
+        svc.verify_auth_challenge("dave".to_string(), signature)
+            .await
+            .unwrap();
+
+        let err = svc
+            .verify_auth_challenge("dave".to_string(), signing_key.sign(&challenge))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn auth_challenge_expires() {
+        let svc = test_service().await;
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let request = RegisterRequest {
+            username: "erin".to_string(),
+            identity_key: signing_key.verifying_key().to_bytes().to_vec(),
+            signed_prekey: Some(sample_prekey(KeyKind::X25519, &[5], &[6])),
+            one_time_prekeys: vec![],
+            kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[7], &[8])),
+        };
+
+        let response = svc.register(Request::new(request)).await.unwrap();
+        let challenge_bytes = response.into_inner().auth_challenge;
+
+        {
+            let mut guard = svc.auth_challenges.lock().await;
+            let challenge = guard.get("erin").cloned().unwrap();
+            guard.insert(
+                "erin".to_string(),
+                AuthChallenge {
+                    created_at: challenge.created_at - (AUTH_CHALLENGE_TTL + Duration::from_secs(1)),
+                    data: challenge.data,
+                },
+            );
+        }
+
+        let signature = signing_key.sign(&challenge_bytes);
+        let err = svc
+            .verify_auth_challenge("erin".to_string(), signature)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::Unauthenticated);
+
+        let guard = svc.auth_challenges.lock().await;
+        assert!(!guard.contains_key("erin"));
+    }
 }
 
 #[tokio::main]
@@ -762,6 +946,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let svc = NewspeakService {
         users: Arc::new(Mutex::new(HashMap::new())),
         server_store: ServerStore::new(db),
+        auth_challenges: Arc::new(Mutex::new(HashMap::new())),
     };
 
     println!("NewspeakServer listening on {}", addr);

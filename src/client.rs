@@ -20,7 +20,7 @@ use crate::{
     ratchet::{RatchetMessage, RatchetState},
 };
 use anyhow::{Result, anyhow};
-use ed25519_dalek as ed25519;
+use ed25519_dalek::{self as ed25519, Signer};
 use ml_kem::{Encoded, EncodedSizeUser, MlKem1024Params, kem::EncapsulationKey};
 use std::io::Write;
 use std::sync::Arc;
@@ -34,6 +34,7 @@ struct User<'a> {
     username: &'a str,
     key_info: Arc<Mutex<KeyExchangeUser>>,
     client: NewspeakClient<Channel>,
+    auth_challenge: Option<[u8; 32]>,
 }
 
 impl From<&pqxdh::SignedPrekey> for newspeak::SignedPrekey {
@@ -66,6 +67,7 @@ impl<'a> User<'a> {
             username,
             key_info: Arc::new(Mutex::new(key_info)),
             client,
+            auth_challenge: None,
         }
     }
 
@@ -75,24 +77,12 @@ impl<'a> User<'a> {
             let one_time_prekeys = key_info
                 .one_time_keys
                 .iter()
-                .filter_map(|(_, key, used)| {
-                    if used {
-                        None
-                    } else {
-                        Some(key.into())
-                    }
-                })
+                .filter_map(|(_, key, used)| if used { None } else { Some(key.into()) })
                 .collect::<Vec<_>>();
             let kem_prekeys = key_info
                 .one_time_kem_keys
                 .iter()
-                .filter_map(|(_, key, used)| {
-                    if used {
-                        None
-                    } else {
-                        Some(key.into())
-                    }
-                })
+                .filter_map(|(_, key, used)| if used { None } else { Some(key.into()) })
                 .collect::<Vec<_>>();
             (
                 key_info.identity_pk.as_bytes().to_vec(),
@@ -110,7 +100,18 @@ impl<'a> User<'a> {
             kem_prekey: Some(kem_prekey),
         };
 
-        self.client.register(req).await?;
+        let response = self.client.register(req).await?.into_inner();
+        let challenge: [u8; 32] = response
+            .auth_challenge
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                anyhow!(
+                    "invalid auth challenge length: {}",
+                    response.auth_challenge.len()
+                )
+            })?;
+        self.auth_challenge = Some(challenge);
         if !kem_prekeys.is_empty() {
             self.client
                 .add_signed_prekeys(AddSignedPrekeysRequest {
@@ -120,6 +121,15 @@ impl<'a> User<'a> {
                 .await?;
         }
         Ok(())
+    }
+
+    pub async fn sign_auth_challenge(&self) -> Result<Vec<u8>> {
+        let challenge = self
+            .auth_challenge
+            .ok_or_else(|| anyhow!("missing auth challenge; register first"))?;
+        let key_info = self.key_info.lock().await;
+        let signature = key_info.identity_sk.sign(&challenge);
+        Ok(signature.to_bytes().to_vec())
     }
 
     pub async fn create_key_exchange_message(
@@ -331,20 +341,57 @@ fn pqxdh_init_from_proto(message: &InitialMessage) -> Result<PQXDHInitMessage> {
 
 const RATCHET_AD: &[u8] = b"ratchet-ad";
 
+async fn choose_conversation(username: &str, store: &LocalStorage) -> anyhow::Result<String> {
+    let conversations = store.get_user_conversations(username).await?;
+
+    let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin);
+
+    if conversations.is_empty() {
+        println!("no conversations found, please enter a username to start a new conversation:");
+        let mut input = String::new();
+
+        reader.read_line(&mut input).await?;
+        Ok(input.trim().to_string())
+    } else {
+        println!("existing conversations:");
+        for (i, convo) in conversations.iter().enumerate() {
+            println!("  {}: {}", i + 1, convo);
+        }
+        println!("enter the number of the conversation to continue, or enter a new username:");
+
+        let mut input = String::new();
+        reader.read_line(&mut input).await?;
+        let input = input.trim();
+
+        if let Ok(index) = input.parse::<usize>() {
+            if index > 0 && index <= conversations.len() {
+                return Ok(conversations[index - 1].clone());
+            }
+        }
+
+        Ok(input.to_string())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let client = NewspeakClient::connect("http://[::1]:10000").await?;
 
-    if args.len() < 3 {
-        println!("usage: newspeak <you> <username>");
+    let storage = LocalStorage::new().await?;
+    if args.len() < 2 {
+        println!("usage: newspeak <you> <optional username>");
         std::process::exit(1);
     }
 
-    let storage = LocalStorage::new().await?;
     let key_info = storage.load_or_create_user(&args[1]).await?;
     let mut user = User::new(&args[1], client, key_info);
-    let receiver = args.get(2).cloned().unwrap_or_else(|| args[1].clone());
+    let receiver = if args.len() < 3 {
+        choose_conversation(&args[1], &storage).await?
+    } else {
+        args.get(2).cloned().unwrap_or_else(|| args[1].clone())
+    };
 
     println!("logged in as: {}", user.username);
 
@@ -364,17 +411,16 @@ async fn main() -> Result<()> {
         .await?;
     let mut inbound = response.into_inner();
 
+    let auth_signature = user.sign_auth_challenge().await?;
     tx.send(ClientMessage {
         message_type: Some(client_message::MessageType::JoinRequest(JoinRequest {
             username: user.username.to_string(),
-            signature: Vec::new(),
+            signature: auth_signature,
         })),
     })
     .await?;
 
-    let stored_conversation = storage
-        .get_conversation(&args[1], &receiver)
-        .await?;
+    let stored_conversation = storage.get_conversation(&args[1], &receiver).await?;
     if stored_conversation.is_some() {
         println!("loaded conversation state for {}", receiver);
         let history = storage
@@ -475,13 +521,22 @@ async fn main() -> Result<()> {
                                         plaintext
                                     ));
                                     if let Err(err) = storage_inbound
-                                        .add_message(&username_inbound, &message.sender_id, &plaintext, false)
+                                        .add_message(
+                                            &username_inbound,
+                                            &message.sender_id,
+                                            &plaintext,
+                                            false,
+                                        )
                                         .await
                                     {
                                         eprintln!("failed to store message: {}", err);
                                     }
                                     if let Err(err) = storage_inbound
-                                        .update_conversation(&username_inbound, &message.sender_id, ratchet)
+                                        .update_conversation(
+                                            &username_inbound,
+                                            &message.sender_id,
+                                            ratchet,
+                                        )
                                         .await
                                     {
                                         eprintln!("failed to update conversation: {}", err);
