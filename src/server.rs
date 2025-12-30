@@ -116,6 +116,109 @@ impl NewspeakService {
 
         Ok(())
     }
+
+    async fn handle_client_message(
+        &self,
+        client_message: ClientMessage,
+        tx: &mpsc::Sender<Result<ServerMessage, Status>>,
+        users: &Arc<Mutex<HashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>>,
+        active_username: &mut Option<String>,
+    ) -> Result<(), Status> {
+        match client_message.message_type {
+            Some(client_message::MessageType::JoinRequest(join_request)) => {
+                self.handle_join_request(join_request, tx, users, active_username)
+                    .await
+            }
+            Some(client_message::MessageType::KeyExchangeMessage(message)) => {
+                let target = message.receiver_id.clone();
+                let server_message = ServerMessage {
+                    message_type: Some(server_message::MessageType::KeyExchange(message)),
+                };
+                self.forward_message(target, server_message, tx, users)
+                    .await;
+                Ok(())
+            }
+            Some(client_message::MessageType::EncryptedMessage(message)) => {
+                let target = message.receiver_id.clone();
+                println!(
+                    "message: {}",
+                    hex::encode(&message.ratchet_message.as_ref().unwrap().ciphertext)
+                );
+                let server_message = ServerMessage {
+                    message_type: Some(server_message::MessageType::Encrypted(message)),
+                };
+                self.forward_message(target, server_message, tx, users)
+                    .await;
+                Ok(())
+            }
+            None => Err(Status::invalid_argument("missing message type")),
+        }
+    }
+
+    async fn handle_join_request(
+        &self,
+        join_request: newspeak::JoinRequest,
+        tx: &mpsc::Sender<Result<ServerMessage, Status>>,
+        users: &Arc<Mutex<HashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>>,
+        active_username: &mut Option<String>,
+    ) -> Result<(), Status> {
+        if join_request.username.is_empty() {
+            return Err(Status::invalid_argument("username is required"));
+        }
+
+        let signature_bytes: [u8; 64] = join_request.signature.as_slice().try_into().map_err(
+            |_| Status::unauthenticated("invalid auth signature length"),
+        )?;
+        let signature = ed25519::Signature::from_bytes(&signature_bytes);
+        self.verify_auth_challenge(join_request.username.clone(), signature)
+            .await?;
+
+        let mut guard = users.lock().await;
+        if guard.contains_key(&join_request.username) {
+            return Err(Status::already_exists("username already connected"));
+        }
+        guard.insert(join_request.username.clone(), tx.clone());
+        *active_username = Some(join_request.username);
+
+        let _ = tx
+            .send(Ok(ServerMessage {
+                message_type: Some(server_message::MessageType::JoinResponse(
+                    JoinResponse {
+                        message: "joined".to_string(),
+                        timestamp: None,
+                    },
+                )),
+            }))
+            .await;
+
+        Ok(())
+    }
+
+    async fn forward_message(
+        &self,
+        target: String,
+        server_message: ServerMessage,
+        tx: &mpsc::Sender<Result<ServerMessage, Status>>,
+        users: &Arc<Mutex<HashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>>,
+    ) {
+        let guard = users.lock().await;
+        if let Some(peer_tx) = guard.get(&target) {
+            let _ = peer_tx.send(Ok(server_message)).await;
+        } else {
+            let _ = tx.send(Ok(server_message)).await;
+        }
+    }
+
+    async fn remove_active_user(
+        &self,
+        users: &Arc<Mutex<HashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>>,
+        active_username: Option<String>,
+    ) {
+        if let Some(username) = active_username {
+            let mut guard = users.lock().await;
+            guard.remove(&username);
+        }
+    }
 }
 
 struct StoredPrekey {
@@ -401,93 +504,19 @@ impl Newspeak for NewspeakService {
             let mut active_username: Option<String> = None;
             while let Some(message) = inbound.message().await.transpose() {
                 match message {
-                    Ok(client_message) => match client_message.message_type {
-                        Some(client_message::MessageType::JoinRequest(join_request)) => {
-                            if join_request.username.is_empty() {
-                                let _ = tx
-                                    .send(Err(Status::invalid_argument("username is required")))
-                                    .await;
-                                continue;
-                            }
-
-                            let signature_bytes: [u8; 64] =
-                                match join_request.signature.as_slice().try_into() {
-                                    Ok(bytes) => bytes,
-                                    Err(_) => {
-                                        let _ = tx
-                                            .send(Err(Status::unauthenticated(
-                                                "invalid auth signature length",
-                                            )))
-                                            .await;
-                                        continue;
-                                    }
-                                };
-                            let signature = ed25519::Signature::from_bytes(&signature_bytes);
-                            if let Err(err) = service
-                                .verify_auth_challenge(join_request.username.clone(), signature)
-                                .await
-                            {
-                                let _ = tx.send(Err(err)).await;
-                                continue;
-                            }
-
-                            let mut guard = users.lock().await;
-                            if guard.contains_key(&join_request.username) {
-                                let _ = tx
-                                    .send(Err(Status::already_exists("username already connected")))
-                                    .await;
-                                continue;
-                            }
-                            guard.insert(join_request.username.clone(), tx.clone());
-                            active_username = Some(join_request.username);
-
-                            let _ = tx
-                                .send(Ok(ServerMessage {
-                                    message_type: Some(server_message::MessageType::JoinResponse(
-                                        JoinResponse {
-                                            message: "joined".to_string(),
-                                            timestamp: None,
-                                        },
-                                    )),
-                                }))
-                                .await;
+                    Ok(client_message) => {
+                        if let Err(status) = service
+                            .handle_client_message(
+                                client_message,
+                                &tx,
+                                &users,
+                                &mut active_username,
+                            )
+                            .await
+                        {
+                            let _ = tx.send(Err(status)).await;
                         }
-                        Some(client_message::MessageType::KeyExchangeMessage(message)) => {
-                            let target = message.receiver_id.clone();
-                            let server_message = ServerMessage {
-                                message_type: Some(server_message::MessageType::KeyExchange(
-                                    message,
-                                )),
-                            };
-                            let guard = users.lock().await;
-                            if let Some(peer_tx) = guard.get(&target) {
-                                let _ = peer_tx.send(Ok(server_message)).await;
-                            } else {
-                                let _ = tx.send(Ok(server_message)).await;
-                            }
-                        }
-                        Some(client_message::MessageType::EncryptedMessage(message)) => {
-                            let target = message.receiver_id.clone();
-                            println!(
-                                "message: {}",
-                                hex::encode(&message.ratchet_message.as_ref().unwrap().ciphertext)
-                            );
-                            let server_message = ServerMessage {
-                                message_type: Some(server_message::MessageType::Encrypted(message)),
-                            };
-                            let guard = users.lock().await;
-                            if let Some(peer_tx) = guard.get(&target) {
-                                let _ = peer_tx.send(Ok(server_message)).await;
-                            } else {
-                                let _ = tx.send(Ok(server_message)).await;
-                            }
-                        }
-                        None => {
-                            let _ = tx
-                                .send(Err(Status::invalid_argument("missing message type")))
-                                .await;
-                        }
-                    },
+                    }
                     Err(status) => {
                         let _ = tx.send(Err(status)).await;
                         break;
@@ -495,10 +524,9 @@ impl Newspeak for NewspeakService {
                 }
             }
 
-            if let Some(username) = active_username {
-                let mut guard = users.lock().await;
-                guard.remove(&username);
-            }
+            service
+                .remove_active_user(&users, active_username)
+                .await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -813,12 +841,7 @@ mod tests {
         }
     }
 
-    fn sample_prekey_with_id(
-        kind: KeyKind,
-        key: &[u8],
-        signature: &[u8],
-        id: u32,
-    ) -> SignedPrekey {
+    fn sample_prekey_with_id(kind: KeyKind, key: &[u8], signature: &[u8], id: u32) -> SignedPrekey {
         SignedPrekey {
             kind: kind as i32,
             key: key.to_vec(),
@@ -939,12 +962,7 @@ mod tests {
             username: "bob".to_string(),
             identity_key: vec![20],
             signed_prekey: Some(sample_prekey(KeyKind::X25519, &[21], &[22])),
-            one_time_prekeys: vec![sample_prekey_with_id(
-                KeyKind::X25519,
-                &[23],
-                &[24],
-                bob_id,
-            )],
+            one_time_prekeys: vec![sample_prekey_with_id(KeyKind::X25519, &[23], &[24], bob_id)],
             kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[25], &[26])),
         };
         svc.register(Request::new(bob_request)).await.unwrap();
