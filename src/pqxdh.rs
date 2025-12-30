@@ -1,6 +1,7 @@
 use std::{collections::HashMap, hash::Hash};
 
 use anyhow::{Context, Error};
+use blake3;
 use ed25519_dalek::{self as ed25519, ed25519::signature::SignerMut};
 use ml_kem::{
     EncodedSizeUser, KemCore, MlKem1024, MlKem1024Params,
@@ -14,6 +15,13 @@ use sha3::{
 use x25519_dalek::{self as x25519};
 
 pub type KemId = [u8; 16];
+
+pub(crate) fn kem_id_from_key(key: &[u8]) -> KemId {
+    let hash = blake3::hash(key);
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&hash.as_bytes()[..16]);
+    id
+}
 
 pub struct KeyExchangeUser {
     pub identity_sk: ed25519::SigningKey,
@@ -194,10 +202,6 @@ pub struct PrekeyBundle {
     pub kem_id: KemId,
 }
 
-fn generate_kem_id() -> [u8; 16] {
-    rand::random()
-}
-
 impl KeyExchangeUser {
     pub fn new() -> KeyExchangeUser {
         let mut rng = rand::thread_rng();
@@ -206,13 +210,14 @@ impl KeyExchangeUser {
         let identity_public_key = identity_private_key.verifying_key();
         let signed_prekey = SignedPrekey::new(&mut rng, &mut identity_private_key);
         let last_resort_kem = SignedMlKemPrekey::new(&mut rng, &mut identity_private_key);
+        let last_resort_id = kem_id_from_key(last_resort_kem.encap_key.as_bytes().as_slice());
 
         let mut u = KeyExchangeUser {
             identity_sk: identity_private_key,
             identity_pk: identity_public_key,
             signed_prekey,
             last_resort_kem,
-            last_resort_id: generate_kem_id(),
+            last_resort_id,
             one_time_keys: KeyStore::new(),
             one_time_kem_keys: KeyStore::new(),
             one_time_prekey_id: 0,
@@ -237,8 +242,8 @@ impl KeyExchangeUser {
     fn add_one_time_kem_keys(&mut self, count: usize) {
         let mut rng = rand::thread_rng(); // Init once
         for _ in 0..count {
-            let id: KemId = generate_kem_id();
             let signed_prekey = SignedMlKemPrekey::new(&mut rng, &mut self.identity_sk);
+            let id = kem_id_from_key(signed_prekey.encap_key.as_bytes().as_slice());
 
             self.one_time_kem_keys.insert(id, signed_prekey);
         }
@@ -318,8 +323,14 @@ impl KeyExchangeUser {
         self: &KeyExchangeUser,
         message: &PQXDHInitMessage,
     ) -> Result<[u8; 32], Error> {
-        let mlkem_shared_secret = self
-            .last_resort_kem
+        let kem_key = if message.kem_used == self.last_resort_id {
+            &self.last_resort_kem
+        } else if let Some(kem_key) = self.one_time_kem_keys.get(&message.kem_used) {
+            kem_key
+        } else {
+            return Err(Error::msg("kem key not found for key exchange"));
+        };
+        let mlkem_shared_secret = kem_key
             .decap_key
             .decapsulate(message.mlkem_ciphertext.as_slice().try_into()?)
             .map_err(|_| Error::msg("failed to decapsulate with ML-KEM-1024"))?;
@@ -354,6 +365,7 @@ impl KeyExchangeUser {
                     )
                 }
                 None => {
+                    println!("otpk key not found {}", otpk_id);
                     return Err(Error::msg(
                         "cannot create shared secret due to missing one-time-key used.",
                     ));
@@ -375,6 +387,7 @@ impl KeyExchangeUser {
 
     fn make_prekey(&self) -> PrekeyBundle {
         let one_time_prekey = self.one_time_keys.first_unused();
+        let one_time_kem_key = self.one_time_kem_keys.first_unused();
         let mut bundle = PrekeyBundle {
             signed_prekey: PublicSignedPrekey::from(&self.signed_prekey),
             kem_prekey: PublicSignedMlKemPrekey::from(&self.last_resort_kem),
@@ -387,6 +400,10 @@ impl KeyExchangeUser {
         if let Some(signed_prekey) = one_time_prekey {
             bundle.one_time_prekey_id = Some(signed_prekey.0.clone());
             bundle.one_time_prekey = Some(PublicSignedPrekey::from(&signed_prekey.1.key));
+        }
+        if let Some(kem_prekey) = one_time_kem_key {
+            bundle.kem_id = *kem_prekey.0;
+            bundle.kem_prekey = PublicSignedMlKemPrekey::from(&kem_prekey.1.key);
         }
 
         bundle
@@ -455,6 +472,24 @@ mod tests {
         let alice = KeyExchangeUser::new();
         let bob = KeyExchangeUser::new();
         let bob_bundle = bob.make_prekey();
+
+        let init = alice.init_key_exchange(&bob_bundle).expect("init");
+        let received = bob.receive_key_exchange(&init.message).expect("receive");
+
+        assert_eq!(init.secret_key, received);
+    }
+
+    #[test]
+    fn pqxdh_uses_one_time_kem_key_when_available() {
+        let alice = KeyExchangeUser::new();
+        let bob = KeyExchangeUser::new();
+        let bob_bundle = bob.make_prekey();
+
+        assert!(bob.one_time_kem_keys.get(&bob_bundle.kem_id).is_some());
+        assert_ne!(
+            bob_bundle.kem_prekey.encap_key.as_bytes(),
+            bob.last_resort_kem.encap_key.as_bytes()
+        );
 
         let init = alice.init_key_exchange(&bob_bundle).expect("init");
         let received = bob.receive_key_exchange(&init.message).expect("receive");

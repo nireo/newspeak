@@ -43,6 +43,7 @@ impl From<&pqxdh::SignedPrekey> for newspeak::SignedPrekey {
             kind: KeyKind::X25519.into(),
             key: k.public_key.as_bytes().to_vec(),
             signature: k.signature.to_vec(),
+            id: 0,
         }
     }
 }
@@ -53,8 +54,15 @@ impl From<&pqxdh::SignedMlKemPrekey> for newspeak::SignedPrekey {
             kind: KeyKind::MlKem1024.into(),
             key: k.encap_key.as_bytes().as_slice().to_vec(),
             signature: k.signature.to_vec(),
+            id: 0,
         }
     }
+}
+
+fn signed_prekey_with_id(id: u32, key: &pqxdh::SignedPrekey) -> newspeak::SignedPrekey {
+    let mut prekey: newspeak::SignedPrekey = key.into();
+    prekey.id = id;
+    prekey
 }
 
 impl<'a> User<'a> {
@@ -77,7 +85,13 @@ impl<'a> User<'a> {
             let one_time_prekeys = key_info
                 .one_time_keys
                 .iter()
-                .filter_map(|(_, key, used)| if used { None } else { Some(key.into()) })
+                .filter_map(|(id, key, used)| {
+                    if used {
+                        None
+                    } else {
+                        Some(signed_prekey_with_id(*id, key))
+                    }
+                })
                 .collect::<Vec<_>>();
             let kem_prekeys = key_info
                 .one_time_kem_keys
@@ -101,16 +115,12 @@ impl<'a> User<'a> {
         };
 
         let response = self.client.register(req).await?.into_inner();
-        let challenge: [u8; 32] = response
-            .auth_challenge
-            .as_slice()
-            .try_into()
-            .map_err(|_| {
-                anyhow!(
-                    "invalid auth challenge length: {}",
-                    response.auth_challenge.len()
-                )
-            })?;
+        let challenge: [u8; 32] = response.auth_challenge.as_slice().try_into().map_err(|_| {
+            anyhow!(
+                "invalid auth challenge length: {}",
+                response.auth_challenge.len()
+            )
+        })?;
         self.auth_challenge = Some(challenge);
         if !kem_prekeys.is_empty() {
             self.client
@@ -379,12 +389,12 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let client = NewspeakClient::connect("http://[::1]:10000").await?;
 
-    let storage = LocalStorage::new().await?;
     if args.len() < 2 {
         println!("usage: newspeak <you> <optional username>");
         std::process::exit(1);
     }
 
+    let storage = LocalStorage::new(&args[1]).await?;
     let key_info = storage.load_or_create_user(&args[1]).await?;
     let mut user = User::new(&args[1], client, key_info);
     let receiver = if args.len() < 3 {

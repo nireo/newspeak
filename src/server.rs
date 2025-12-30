@@ -129,7 +129,7 @@ struct ServerUser {
     identity_key: Vec<u8>,
     signed_prekey: SignedPrekey,
     kem_prekey: SignedPrekey,
-    one_time_prekeys: Vec<SignedPrekey>,
+    one_time_prekeys: Vec<StoredPrekey>,
 }
 
 #[derive(Clone)]
@@ -173,7 +173,7 @@ impl ServerStore {
             let user_id = tx.last_insert_rowid();
 
             for prekey in user.one_time_prekeys {
-                insert_one_time_key(&tx, "one_time_prekeys", user_id, &prekey)?;
+                insert_one_time_key(&tx, "one_time_prekeys", user_id, prekey.id, &prekey.prekey)?;
             }
             tx.commit()?;
             Ok(())
@@ -219,11 +219,13 @@ impl ServerStore {
                                     kind: signed_prekey_kind,
                                     key: signed_prekey_key,
                                     signature: signed_prekey_signature,
+                                    id: 0,
                                 },
                                 kem_prekey: SignedPrekey {
                                     kind: kem_prekey_kind,
                                     key: kem_prekey_key,
                                     signature: kem_prekey_signature,
+                                    id: 0,
                                 },
                                 one_time_prekeys: Vec::new(), // to be filled later
                             })
@@ -281,11 +283,13 @@ impl ServerStore {
                                     kind: signed_prekey_kind,
                                     key: signed_prekey_key,
                                     signature: signed_prekey_signature,
+                                    id: 0,
                                 },
                                 SignedPrekey {
                                     kind: kem_prekey_kind,
                                     key: kem_prekey_key,
                                     signature: kem_prekey_signature,
+                                    id: 0,
                                 },
                             ))
                         },
@@ -333,7 +337,7 @@ impl ServerStore {
     async fn add_one_time_prekeys(
         &self,
         user_id: i64,
-        prekeys: Vec<SignedPrekey>,
+        prekeys: Vec<StoredPrekey>,
         kem_prekeys: Vec<SignedPrekey>,
     ) -> Result<i32, Status> {
         let db = Arc::clone(&self.db);
@@ -342,6 +346,13 @@ impl ServerStore {
                 let tx = conn.transaction()?;
                 let mut count = 0;
                 count += insert_one_time_keys(&tx, "one_time_prekeys", user_id, prekeys)?;
+                let kem_prekeys = kem_prekeys
+                    .into_iter()
+                    .map(|prekey| StoredPrekey {
+                        id: kem_db_id_from_key(&prekey.key),
+                        prekey,
+                    })
+                    .collect();
                 count += insert_one_time_keys(&tx, "one_time_kem_keys", user_id, kem_prekeys)?;
                 tx.commit()?;
                 Ok::<i32, RusqliteError>(count)
@@ -399,21 +410,18 @@ impl Newspeak for NewspeakService {
                                 continue;
                             }
 
-                            let signature_bytes: [u8; 64] = match join_request
-                                .signature
-                                .as_slice()
-                                .try_into()
-                            {
-                                Ok(bytes) => bytes,
-                                Err(_) => {
-                                    let _ = tx
-                                        .send(Err(Status::unauthenticated(
-                                            "invalid auth signature length",
-                                        )))
-                                        .await;
-                                    continue;
-                                }
-                            };
+                            let signature_bytes: [u8; 64] =
+                                match join_request.signature.as_slice().try_into() {
+                                    Ok(bytes) => bytes,
+                                    Err(_) => {
+                                        let _ = tx
+                                            .send(Err(Status::unauthenticated(
+                                                "invalid auth signature length",
+                                            )))
+                                            .await;
+                                        continue;
+                                    }
+                                };
                             let signature = ed25519::Signature::from_bytes(&signature_bytes);
                             if let Err(err) = service
                                 .verify_auth_challenge(join_request.username.clone(), signature)
@@ -537,7 +545,10 @@ impl Newspeak for NewspeakService {
                 })?;
 
             match kind {
-                newspeak::KeyKind::X25519 => x25519_keys.push(key),
+                newspeak::KeyKind::X25519 => x25519_keys.push(StoredPrekey {
+                    id: i64::from(key.id),
+                    prekey: key,
+                }),
                 newspeak::KeyKind::MlKem1024 => kem_keys.push(key),
             }
         }
@@ -569,7 +580,14 @@ impl Newspeak for NewspeakService {
         let username = request.username;
         let challenge_username = username.clone();
         let identity_key = request.identity_key;
-        let one_time_prekeys = request.one_time_prekeys;
+        let one_time_prekeys = request
+            .one_time_prekeys
+            .into_iter()
+            .map(|prekey| StoredPrekey {
+                id: i64::from(prekey.id),
+                prekey,
+            })
+            .collect();
 
         let server_user = ServerUser {
             id: None,
@@ -593,21 +611,23 @@ fn insert_one_time_key(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
     user_id: i64,
+    id: i64,
     prekey: &SignedPrekey,
 ) -> Result<(), RusqliteError> {
     let sql = format!(
         "INSERT INTO {} (
+            id,
             user_id,
             kind,
             key,
             signature
-        ) VALUES (?1, ?2, ?3, ?4)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5)",
         table
     );
 
     tx.execute(
         &sql,
-        params![user_id, prekey.kind, prekey.key, prekey.signature],
+        params![id, user_id, prekey.kind, prekey.key, prekey.signature],
     )?;
     Ok(())
 }
@@ -616,11 +636,11 @@ fn insert_one_time_keys(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
     user_id: i64,
-    prekeys: Vec<SignedPrekey>,
+    prekeys: Vec<StoredPrekey>,
 ) -> Result<i32, RusqliteError> {
     let mut count = 0;
     for prekey in prekeys {
-        insert_one_time_key(tx, table, user_id, &prekey)?;
+        insert_one_time_key(tx, table, user_id, prekey.id, &prekey.prekey)?;
         count += 1;
     }
     Ok(count)
@@ -646,20 +666,22 @@ fn take_one_time_key(
             let kind: i32 = row.get(1)?;
             let key: Vec<u8> = row.get(2)?;
             let signature: Vec<u8> = row.get(3)?;
+            let prekey_id = u32::try_from(id).unwrap_or(0);
             Ok((
                 id,
                 SignedPrekey {
                     kind,
                     key,
                     signature,
+                    id: prekey_id,
                 },
             ))
         })
         .optional()?;
 
     if let Some((id, prekey)) = row {
-        let delete_sql = format!("DELETE FROM {} WHERE id = ?1", table);
-        tx.execute(&delete_sql, params![id])?;
+        let delete_sql = format!("DELETE FROM {} WHERE id = ?1 AND user_id = ?2", table);
+        tx.execute(&delete_sql, params![id, user_id])?;
         Ok(Some(StoredPrekey { id, prekey }))
     } else {
         Ok(None)
@@ -668,6 +690,13 @@ fn take_one_time_key(
 
 fn kem_id_from_key(key: &[u8]) -> Vec<u8> {
     blake3::hash(key).as_bytes()[..16].to_vec()
+}
+
+fn kem_db_id_from_key(key: &[u8]) -> i64 {
+    let hash = blake3::hash(key);
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&hash.as_bytes()[..8]);
+    i64::from_le_bytes(bytes)
 }
 
 fn map_db_error(err: TokioRusqliteError<RusqliteError>) -> Status {
@@ -699,24 +728,29 @@ async fn init_db(conn: &Connection) -> Result<(), TokioRusqliteError<RusqliteErr
                 kem_prekey_signature BLOB NOT NULL,
                 signed_prekey_created_at INTEGER
             );
+
             CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username);
+
             CREATE TABLE IF NOT EXISTS one_time_prekeys (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                id INTEGER,
+                user_id INTEGER,
                 kind INTEGER NOT NULL,
                 key BLOB NOT NULL,
                 signature BLOB NOT NULL,
                 created_at INTEGER,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                PRIMARY KEY (id, user_id)
             );
+
             CREATE TABLE IF NOT EXISTS one_time_kem_keys (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                id INTEGER,
+                user_id INTEGER,
                 kind INTEGER NOT NULL,
                 key BLOB NOT NULL,
                 signature BLOB NOT NULL,
                 created_at INTEGER,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                PRIMARY KEY (id, user_id)
             );",
         )?;
         Ok::<(), RusqliteError>(())
@@ -766,8 +800,8 @@ impl ServerStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use newspeak::KeyKind;
     use ed25519_dalek::{Signer, SigningKey};
+    use newspeak::KeyKind;
     use tonic::Code;
 
     fn sample_prekey(kind: KeyKind, key: &[u8], signature: &[u8]) -> SignedPrekey {
@@ -775,6 +809,21 @@ mod tests {
             kind: kind as i32,
             key: key.to_vec(),
             signature: signature.to_vec(),
+            id: 0,
+        }
+    }
+
+    fn sample_prekey_with_id(
+        kind: KeyKind,
+        key: &[u8],
+        signature: &[u8],
+        id: u32,
+    ) -> SignedPrekey {
+        SignedPrekey {
+            kind: kind as i32,
+            key: key.to_vec(),
+            signature: signature.to_vec(),
+            id,
         }
     }
 
@@ -796,7 +845,7 @@ mod tests {
             username: "alice".to_string(),
             identity_key: vec![1, 2, 3],
             signed_prekey: Some(sample_prekey(KeyKind::X25519, &[4, 5], &[6])),
-            one_time_prekeys: vec![sample_prekey(KeyKind::X25519, &[7], &[8])],
+            one_time_prekeys: vec![sample_prekey_with_id(KeyKind::X25519, &[7], &[8], 1)],
             kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[9], &[10])),
         };
 
@@ -830,7 +879,7 @@ mod tests {
             username: "carol".to_string(),
             identity_key: vec![1],
             signed_prekey: Some(sample_prekey(KeyKind::X25519, &[2], &[3])),
-            one_time_prekeys: vec![sample_prekey(KeyKind::X25519, &[4], &[5])],
+            one_time_prekeys: vec![sample_prekey_with_id(KeyKind::X25519, &[4], &[5], 7)],
             kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[6], &[7])),
         };
 
@@ -844,7 +893,7 @@ mod tests {
             .unwrap();
         let user_id = user.id.unwrap();
         svc.server_store
-            .add_one_time_prekeys(user_id, Vec::new(), vec![kem_prekey])
+            .add_one_time_prekeys(user_id, Vec::<StoredPrekey>::new(), vec![kem_prekey])
             .await
             .unwrap();
 
@@ -864,6 +913,65 @@ mod tests {
         let counts = svc.server_store.count_one_time_keys().await.unwrap();
 
         assert_eq!(counts, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn one_time_prekey_ids_are_scoped_per_user() {
+        let svc = test_service().await;
+        let alice_id = 42u32;
+        let bob_id = 42u32;
+
+        let alice_request = RegisterRequest {
+            username: "alice".to_string(),
+            identity_key: vec![10],
+            signed_prekey: Some(sample_prekey(KeyKind::X25519, &[11], &[12])),
+            one_time_prekeys: vec![sample_prekey_with_id(
+                KeyKind::X25519,
+                &[13],
+                &[14],
+                alice_id,
+            )],
+            kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[15], &[16])),
+        };
+        svc.register(Request::new(alice_request)).await.unwrap();
+
+        let bob_request = RegisterRequest {
+            username: "bob".to_string(),
+            identity_key: vec![20],
+            signed_prekey: Some(sample_prekey(KeyKind::X25519, &[21], &[22])),
+            one_time_prekeys: vec![sample_prekey_with_id(
+                KeyKind::X25519,
+                &[23],
+                &[24],
+                bob_id,
+            )],
+            kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[25], &[26])),
+        };
+        svc.register(Request::new(bob_request)).await.unwrap();
+
+        let alice_bundle = svc
+            .fetch_prekey_bundle(Request::new(FetchPrekeyBundleRequest {
+                username: "alice".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .bundle
+            .unwrap();
+        assert_eq!(alice_bundle.one_time_prekey_id, Some(alice_id));
+        assert_eq!(alice_bundle.one_time_prekey.unwrap().key, vec![13]);
+
+        let bob_bundle = svc
+            .fetch_prekey_bundle(Request::new(FetchPrekeyBundleRequest {
+                username: "bob".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .bundle
+            .unwrap();
+        assert_eq!(bob_bundle.one_time_prekey_id, Some(bob_id));
+        assert_eq!(bob_bundle.one_time_prekey.unwrap().key, vec![23]);
     }
 
     #[tokio::test]
@@ -919,7 +1027,8 @@ mod tests {
             guard.insert(
                 "erin".to_string(),
                 AuthChallenge {
-                    created_at: challenge.created_at - (AUTH_CHALLENGE_TTL + Duration::from_secs(1)),
+                    created_at: challenge.created_at
+                        - (AUTH_CHALLENGE_TTL + Duration::from_secs(1)),
                     data: challenge.data,
                 },
             );
@@ -940,7 +1049,7 @@ mod tests {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:10000".parse()?;
-    let db = Connection::open("newspeak.db").await?;
+    let db = Connection::open("server_newspeak.db").await?;
     init_db(&db).await?;
     let db = Arc::new(db);
     let svc = NewspeakService {

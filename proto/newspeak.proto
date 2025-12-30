@@ -29,6 +29,7 @@ message SignedPrekey {
   KeyKind kind = 1;
   bytes key = 2;
   bytes signature = 3;
+  uint32 id = 4;
 }
 
 message PrekeyBundle {

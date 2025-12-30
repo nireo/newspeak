@@ -35,8 +35,8 @@ struct StoredUser {
 }
 
 impl LocalStorage {
-    pub async fn new() -> Result<Self> {
-        Self::new_with_path("newspeak.db").await
+    pub async fn new(username: &str) -> Result<Self> {
+        Self::new_with_path(format!("{}_newspeak.db", username)).await
     }
 
     pub async fn new_with_path(path: impl AsRef<Path>) -> Result<Self> {
@@ -655,13 +655,15 @@ fn stored_user_to_key_exchange_user(stored: StoredUser) -> Result<pqxdh::KeyExch
         .max()
         .map(|id| id.saturating_add(1))
         .unwrap_or(0);
+    let last_resort_id =
+        pqxdh::kem_id_from_key(last_resort_kem.encap_key.as_bytes().as_slice());
 
     Ok(pqxdh::KeyExchangeUser {
         identity_sk,
         identity_pk,
         signed_prekey,
         last_resort_kem,
-        last_resort_id: rand::random(),
+        last_resort_id,
         one_time_keys,
         one_time_kem_keys,
         one_time_prekey_id,
@@ -876,12 +878,14 @@ mod tests {
         let signed_prekey = pqxdh::SignedPrekey::new(&mut rng, &mut identity_sk);
         let last_resort_kem = pqxdh::SignedMlKemPrekey::new(&mut rng, &mut identity_sk);
 
+        let last_resort_id =
+            pqxdh::kem_id_from_key(last_resort_kem.encap_key.as_bytes().as_slice());
         let user = pqxdh::KeyExchangeUser {
             identity_sk,
             identity_pk,
             signed_prekey,
             last_resort_kem,
-            last_resort_id: rand::random(),
+            last_resort_id,
             one_time_keys: pqxdh::KeyStore::new(),
             one_time_kem_keys: pqxdh::KeyStore::new(),
             one_time_prekey_id: 0,
