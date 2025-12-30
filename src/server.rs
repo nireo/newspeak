@@ -20,6 +20,7 @@ use tokio_rusqlite::rusqlite::{self, Error as RusqliteError, OptionalExtension, 
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
+use dashmap::DashMap;
 
 use crate::newspeak::{
     AddSignedPrekeysRequest, AddSignedPrekeysResponse, ClientMessage, JoinResponse, ServerMessage,
@@ -36,7 +37,7 @@ const AUTH_CHALLENGE_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
 struct NewspeakService {
-    users: Arc<Mutex<HashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>>,
+    users: Arc<DashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>,
     server_store: ServerStore,
 
     // auth_challenges are returned on registeration and to successfully join a stream the handler
@@ -121,7 +122,7 @@ impl NewspeakService {
         &self,
         client_message: ClientMessage,
         tx: &mpsc::Sender<Result<ServerMessage, Status>>,
-        users: &Arc<Mutex<HashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>>,
+        users: &Arc<DashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>,
         active_username: &mut Option<String>,
     ) -> Result<(), Status> {
         match client_message.message_type {
@@ -159,35 +160,34 @@ impl NewspeakService {
         &self,
         join_request: newspeak::JoinRequest,
         tx: &mpsc::Sender<Result<ServerMessage, Status>>,
-        users: &Arc<Mutex<HashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>>,
+        users: &Arc<DashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>,
         active_username: &mut Option<String>,
     ) -> Result<(), Status> {
         if join_request.username.is_empty() {
             return Err(Status::invalid_argument("username is required"));
         }
 
-        let signature_bytes: [u8; 64] = join_request.signature.as_slice().try_into().map_err(
-            |_| Status::unauthenticated("invalid auth signature length"),
-        )?;
+        let signature_bytes: [u8; 64] = join_request
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::unauthenticated("invalid auth signature length"))?;
         let signature = ed25519::Signature::from_bytes(&signature_bytes);
         self.verify_auth_challenge(join_request.username.clone(), signature)
             .await?;
 
-        let mut guard = users.lock().await;
-        if guard.contains_key(&join_request.username) {
+        if users.contains_key(&join_request.username) {
             return Err(Status::already_exists("username already connected"));
         }
-        guard.insert(join_request.username.clone(), tx.clone());
+        users.insert(join_request.username.clone(), tx.clone());
         *active_username = Some(join_request.username);
 
         let _ = tx
             .send(Ok(ServerMessage {
-                message_type: Some(server_message::MessageType::JoinResponse(
-                    JoinResponse {
-                        message: "joined".to_string(),
-                        timestamp: None,
-                    },
-                )),
+                message_type: Some(server_message::MessageType::JoinResponse(JoinResponse {
+                    message: "joined".to_string(),
+                    timestamp: None,
+                })),
             }))
             .await;
 
@@ -199,10 +199,9 @@ impl NewspeakService {
         target: String,
         server_message: ServerMessage,
         tx: &mpsc::Sender<Result<ServerMessage, Status>>,
-        users: &Arc<Mutex<HashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>>,
+        users: &Arc<DashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>,
     ) {
-        let guard = users.lock().await;
-        if let Some(peer_tx) = guard.get(&target) {
+        if let Some(peer_tx) = users.get(&target) {
             let _ = peer_tx.send(Ok(server_message)).await;
         } else {
             let _ = tx.send(Ok(server_message)).await;
@@ -211,12 +210,11 @@ impl NewspeakService {
 
     async fn remove_active_user(
         &self,
-        users: &Arc<Mutex<HashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>>,
+        users: &Arc<DashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>,
         active_username: Option<String>,
     ) {
         if let Some(username) = active_username {
-            let mut guard = users.lock().await;
-            guard.remove(&username);
+            users.remove(&username);
         }
     }
 }
@@ -524,9 +522,7 @@ impl Newspeak for NewspeakService {
                 }
             }
 
-            service
-                .remove_active_user(&users, active_username)
-                .await;
+            service.remove_active_user(&users, active_username).await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -855,7 +851,7 @@ mod tests {
         init_db(&db).await.unwrap();
         let db = Arc::new(db);
         NewspeakService {
-            users: Arc::new(Mutex::new(HashMap::new())),
+            users: Arc::new(DashMap::new()),
             server_store: ServerStore::new(db),
             auth_challenges: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1071,7 +1067,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_db(&db).await?;
     let db = Arc::new(db);
     let svc = NewspeakService {
-        users: Arc::new(Mutex::new(HashMap::new())),
+        users: Arc::new(DashMap::new()),
         server_store: ServerStore::new(db),
         auth_challenges: Arc::new(Mutex::new(HashMap::new())),
     };
