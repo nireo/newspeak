@@ -10,13 +10,10 @@ use newspeak::{
     RegisterResponse, SignedPrekey,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::time::{self, Duration, Instant};
-use tokio_rusqlite::Connection;
-use tokio_rusqlite::Error as TokioRusqliteError;
-use tokio_rusqlite::rusqlite::{self, Error as RusqliteError, OptionalExtension, params};
+use rusqlite::{self, Connection, Error as RusqliteError, OptionalExtension, params};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
@@ -43,7 +40,7 @@ struct NewspeakService {
     // auth_challenges are returned on registeration and to successfully join a stream the handler
     // the client must return a signature for the challenge signed with their longterm identity
     // key.
-    auth_challenges: Arc<Mutex<HashMap<String, AuthChallenge>>>,
+    auth_challenges: Arc<AsyncMutex<HashMap<String, AuthChallenge>>>,
 }
 
 impl NewspeakService {
@@ -235,204 +232,196 @@ struct ServerUser {
 
 #[derive(Clone)]
 struct ServerStore {
-    db: Arc<Connection>,
+    db: Arc<StdMutex<Connection>>,
 }
 
 impl ServerStore {
-    fn new(db: Arc<Connection>) -> Self {
+    fn new(db: Arc<StdMutex<Connection>>) -> Self {
         Self { db }
     }
 
     async fn insert_user(&self, user: ServerUser) -> Result<(), Status> {
-        let db = Arc::clone(&self.db);
-        db.call(move |conn| {
-            let tx = conn.transaction()?;
+        let mut conn = self
+            .db
+            .lock()
+            .map_err(|_| Status::internal("database lock poisoned"))?;
+        let tx = conn.transaction().map_err(map_db_error)?;
 
-            tx.execute(
-                "INSERT INTO users (
-                    username,
-                    identity_key,
-                    signed_prekey_kind,
-                    signed_prekey_key,
-                    signed_prekey_signature,
-                    kem_prekey_kind,
-                    kem_prekey_key,
-                    kem_prekey_signature
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    user.username,
-                    user.identity_key,
-                    user.signed_prekey.kind,
-                    user.signed_prekey.key,
-                    user.signed_prekey.signature,
-                    user.kem_prekey.kind,
-                    user.kem_prekey.key,
-                    user.kem_prekey.signature
-                ],
-            )?;
-
-            let user_id = tx.last_insert_rowid();
-
-            for prekey in user.one_time_prekeys {
-                insert_one_time_key(&tx, "one_time_prekeys", user_id, prekey.id, &prekey.prekey)?;
-            }
-            tx.commit()?;
-            Ok(())
-        })
-        .await
+        tx.execute(
+            "INSERT INTO users (
+                username,
+                identity_key,
+                signed_prekey_kind,
+                signed_prekey_key,
+                signed_prekey_signature,
+                kem_prekey_kind,
+                kem_prekey_key,
+                kem_prekey_signature
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                user.username,
+                user.identity_key,
+                user.signed_prekey.kind,
+                user.signed_prekey.key,
+                user.signed_prekey.signature,
+                user.kem_prekey.kind,
+                user.kem_prekey.key,
+                user.kem_prekey.signature
+            ],
+        )
         .map_err(map_db_error)?;
+
+        let user_id = tx.last_insert_rowid();
+
+        for prekey in user.one_time_prekeys {
+            insert_one_time_key(&tx, "one_time_prekeys", user_id, prekey.id, &prekey.prekey)
+                .map_err(map_db_error)?;
+        }
+        tx.commit().map_err(map_db_error)?;
         Ok(())
     }
 
     async fn get_user(&self, username: String) -> Result<ServerUser, Status> {
-        let db = Arc::clone(&self.db);
-        let user = db
-            .call(move |conn| {
-                let tx = conn.transaction()?;
+        let mut conn = self
+            .db
+            .lock()
+            .map_err(|_| Status::internal("database lock poisoned"))?;
+        let tx = conn.transaction().map_err(map_db_error)?;
 
-                let user_row: Option<ServerUser> = tx
-                    .query_row(
-                        "SELECT id,
-                                identity_key,
-                                signed_prekey_kind,
-                                signed_prekey_key,
-                                signed_prekey_signature,
-                                kem_prekey_kind,
-                                kem_prekey_key,
-                                kem_prekey_signature
-                        FROM users
-                        WHERE username = ?1",
-                        params![username],
-                        |row| {
-                            let user_id: i64 = row.get(0)?;
-                            let identity_key: Vec<u8> = row.get(1)?;
-                            let signed_prekey_kind: i32 = row.get(2)?;
-                            let signed_prekey_key: Vec<u8> = row.get(3)?;
-                            let signed_prekey_signature: Vec<u8> = row.get(4)?;
-                            let kem_prekey_kind: i32 = row.get(5)?;
-                            let kem_prekey_key: Vec<u8> = row.get(6)?;
-                            let kem_prekey_signature: Vec<u8> = row.get(7)?;
-                            Ok(ServerUser {
-                                id: Some(user_id),
-                                username: username.to_string(),
-                                identity_key,
-                                signed_prekey: SignedPrekey {
-                                    kind: signed_prekey_kind,
-                                    key: signed_prekey_key,
-                                    signature: signed_prekey_signature,
-                                    id: 0,
-                                },
-                                kem_prekey: SignedPrekey {
-                                    kind: kem_prekey_kind,
-                                    key: kem_prekey_key,
-                                    signature: kem_prekey_signature,
-                                    id: 0,
-                                },
-                                one_time_prekeys: Vec::new(), // to be filled later
-                            })
+        let user_row: Option<ServerUser> = tx
+            .query_row(
+                "SELECT id,
+                        identity_key,
+                        signed_prekey_kind,
+                        signed_prekey_key,
+                        signed_prekey_signature,
+                        kem_prekey_kind,
+                        kem_prekey_key,
+                        kem_prekey_signature
+                FROM users
+                WHERE username = ?1",
+                params![username.as_str()],
+                |row| {
+                    let user_id: i64 = row.get(0)?;
+                    let identity_key: Vec<u8> = row.get(1)?;
+                    let signed_prekey_kind: i32 = row.get(2)?;
+                    let signed_prekey_key: Vec<u8> = row.get(3)?;
+                    let signed_prekey_signature: Vec<u8> = row.get(4)?;
+                    let kem_prekey_kind: i32 = row.get(5)?;
+                    let kem_prekey_key: Vec<u8> = row.get(6)?;
+                    let kem_prekey_signature: Vec<u8> = row.get(7)?;
+                    Ok(ServerUser {
+                        id: Some(user_id),
+                        username: username.to_string(),
+                        identity_key,
+                        signed_prekey: SignedPrekey {
+                            kind: signed_prekey_kind,
+                            key: signed_prekey_key,
+                            signature: signed_prekey_signature,
+                            id: 0,
                         },
-                    )
-                    .optional()?;
-
-                if user_row.is_none() {
-                    return Ok(None);
-                }
-
-                tx.commit()?;
-
-                // unwrap is safe here because of the earlier check
-                Ok(Some(user_row.unwrap()))
-            })
-            .await
+                        kem_prekey: SignedPrekey {
+                            kind: kem_prekey_kind,
+                            key: kem_prekey_key,
+                            signature: kem_prekey_signature,
+                            id: 0,
+                        },
+                        one_time_prekeys: Vec::new(), // to be filled later
+                    })
+                },
+            )
+            .optional()
             .map_err(map_db_error)?;
-        let user = user.ok_or_else(|| Status::not_found("username not registered"))?;
+
+        tx.commit().map_err(map_db_error)?;
+
+        let user = user_row.ok_or_else(|| Status::not_found("username not registered"))?;
         Ok(user)
     }
 
     async fn fetch_prekey_bundle(&self, username: String) -> Result<PrekeyBundle, Status> {
-        let db = Arc::clone(&self.db);
-        let bundle = db
-            .call(move |conn| {
-                let tx = conn.transaction()?;
+        let mut conn = self
+            .db
+            .lock()
+            .map_err(|_| Status::internal("database lock poisoned"))?;
+        let tx = conn.transaction().map_err(map_db_error)?;
 
-                let user_row: Option<(i64, Vec<u8>, SignedPrekey, SignedPrekey)> = tx
-                    .query_row(
-                        "SELECT id,
-                                identity_key,
-                                signed_prekey_kind,
-                                signed_prekey_key,
-                                signed_prekey_signature,
-                                kem_prekey_kind,
-                                kem_prekey_key,
-                                kem_prekey_signature
-                        FROM users
-                        WHERE username = ?1",
-                        params![username],
-                        |row| {
-                            let user_id: i64 = row.get(0)?;
-                            let identity_key: Vec<u8> = row.get(1)?;
-                            let signed_prekey_kind: i32 = row.get(2)?;
-                            let signed_prekey_key: Vec<u8> = row.get(3)?;
-                            let signed_prekey_signature: Vec<u8> = row.get(4)?;
-                            let kem_prekey_kind: i32 = row.get(5)?;
-                            let kem_prekey_key: Vec<u8> = row.get(6)?;
-                            let kem_prekey_signature: Vec<u8> = row.get(7)?;
-                            Ok((
-                                user_id,
-                                identity_key,
-                                SignedPrekey {
-                                    kind: signed_prekey_kind,
-                                    key: signed_prekey_key,
-                                    signature: signed_prekey_signature,
-                                    id: 0,
-                                },
-                                SignedPrekey {
-                                    kind: kem_prekey_kind,
-                                    key: kem_prekey_key,
-                                    signature: kem_prekey_signature,
-                                    id: 0,
-                                },
-                            ))
+        let user_row: Option<(i64, Vec<u8>, SignedPrekey, SignedPrekey)> = tx
+            .query_row(
+                "SELECT id,
+                        identity_key,
+                        signed_prekey_kind,
+                        signed_prekey_key,
+                        signed_prekey_signature,
+                        kem_prekey_kind,
+                        kem_prekey_key,
+                        kem_prekey_signature
+                FROM users
+                WHERE username = ?1",
+                params![username.as_str()],
+                |row| {
+                    let user_id: i64 = row.get(0)?;
+                    let identity_key: Vec<u8> = row.get(1)?;
+                    let signed_prekey_kind: i32 = row.get(2)?;
+                    let signed_prekey_key: Vec<u8> = row.get(3)?;
+                    let signed_prekey_signature: Vec<u8> = row.get(4)?;
+                    let kem_prekey_kind: i32 = row.get(5)?;
+                    let kem_prekey_key: Vec<u8> = row.get(6)?;
+                    let kem_prekey_signature: Vec<u8> = row.get(7)?;
+                    Ok((
+                        user_id,
+                        identity_key,
+                        SignedPrekey {
+                            kind: signed_prekey_kind,
+                            key: signed_prekey_key,
+                            signature: signed_prekey_signature,
+                            id: 0,
                         },
-                    )
-                    .optional()?;
-
-                let Some((user_id, identity_key, signed_prekey, kem_prekey)) = user_row else {
-                    return Ok(None);
-                };
-
-                let kem_encap_key = take_one_time_key(&tx, "one_time_kem_keys", user_id)?;
-                let (kem_encap_key, kem_id) = match kem_encap_key {
-                    Some(prekey) => {
-                        let kem_id = kem_id_from_key(&prekey.prekey.key);
-                        (prekey.prekey, kem_id)
-                    }
-                    None => {
-                        let kem_id = kem_id_from_key(&kem_prekey.key);
-                        (kem_prekey, kem_id)
-                    }
-                };
-                let one_time_prekey = take_one_time_key(&tx, "one_time_prekeys", user_id)?;
-                let (one_time_prekey, one_time_prekey_id) = match one_time_prekey {
-                    Some(prekey) => (Some(prekey.prekey), Some(prekey.id as u32)),
-                    None => (None, None),
-                };
-
-                tx.commit()?;
-
-                Ok(Some(PrekeyBundle {
-                    identity_key,
-                    signed_prekey: Some(signed_prekey),
-                    kem_encap_key: Some(kem_encap_key),
-                    one_time_prekey,
-                    kem_id,
-                    one_time_prekey_id,
-                }))
-            })
-            .await
+                        SignedPrekey {
+                            kind: kem_prekey_kind,
+                            key: kem_prekey_key,
+                            signature: kem_prekey_signature,
+                            id: 0,
+                        },
+                    ))
+                },
+            )
+            .optional()
             .map_err(map_db_error)?;
 
-        bundle.ok_or_else(|| Status::not_found("username not registered"))
+        let Some((user_id, identity_key, signed_prekey, kem_prekey)) = user_row else {
+            return Err(Status::not_found("username not registered"));
+        };
+
+        let kem_encap_key =
+            take_one_time_key(&tx, "one_time_kem_keys", user_id).map_err(map_db_error)?;
+        let (kem_encap_key, kem_id) = match kem_encap_key {
+            Some(prekey) => {
+                let kem_id = kem_id_from_key(&prekey.prekey.key);
+                (prekey.prekey, kem_id)
+            }
+            None => {
+                let kem_id = kem_id_from_key(&kem_prekey.key);
+                (kem_prekey, kem_id)
+            }
+        };
+        let one_time_prekey =
+            take_one_time_key(&tx, "one_time_prekeys", user_id).map_err(map_db_error)?;
+        let (one_time_prekey, one_time_prekey_id) = match one_time_prekey {
+            Some(prekey) => (Some(prekey.prekey), Some(prekey.id as u32)),
+            None => (None, None),
+        };
+
+        tx.commit().map_err(map_db_error)?;
+
+        Ok(PrekeyBundle {
+            identity_key,
+            signed_prekey: Some(signed_prekey),
+            kem_encap_key: Some(kem_encap_key),
+            one_time_prekey,
+            kem_id,
+            one_time_prekey_id,
+        })
     }
 
     async fn add_one_time_prekeys(
@@ -441,26 +430,25 @@ impl ServerStore {
         prekeys: Vec<StoredPrekey>,
         kem_prekeys: Vec<SignedPrekey>,
     ) -> Result<i32, Status> {
-        let db = Arc::clone(&self.db);
-        let inserted = db
-            .call(move |conn| {
-                let tx = conn.transaction()?;
-                let mut count = 0;
-                count += insert_one_time_keys(&tx, "one_time_prekeys", user_id, prekeys)?;
-                let kem_prekeys = kem_prekeys
-                    .into_iter()
-                    .map(|prekey| StoredPrekey {
-                        id: kem_db_id_from_key(&prekey.key),
-                        prekey,
-                    })
-                    .collect();
-                count += insert_one_time_keys(&tx, "one_time_kem_keys", user_id, kem_prekeys)?;
-                tx.commit()?;
-                Ok::<i32, RusqliteError>(count)
-            })
-            .await
+        let mut conn = self
+            .db
+            .lock()
+            .map_err(|_| Status::internal("database lock poisoned"))?;
+        let tx = conn.transaction().map_err(map_db_error)?;
+        let mut count = 0;
+        count += insert_one_time_keys(&tx, "one_time_prekeys", user_id, prekeys)
             .map_err(map_db_error)?;
-        Ok(inserted)
+        let kem_prekeys = kem_prekeys
+            .into_iter()
+            .map(|prekey| StoredPrekey {
+                id: kem_db_id_from_key(&prekey.key),
+                prekey,
+            })
+            .collect();
+        count += insert_one_time_keys(&tx, "one_time_kem_keys", user_id, kem_prekeys)
+            .map_err(map_db_error)?;
+        tx.commit().map_err(map_db_error)?;
+        Ok(count)
     }
 }
 
@@ -723,100 +711,90 @@ fn kem_db_id_from_key(key: &[u8]) -> i64 {
     i64::from_le_bytes(bytes)
 }
 
-fn map_db_error(err: TokioRusqliteError<RusqliteError>) -> Status {
+fn map_db_error(err: RusqliteError) -> Status {
     match err {
-        TokioRusqliteError::Error(RusqliteError::SqliteFailure(code, _)) => match code.code {
+        RusqliteError::SqliteFailure(code, _) => match code.code {
             rusqlite::ErrorCode::ConstraintViolation => {
                 Status::already_exists("username already registered")
             }
             _ => Status::internal(format!("database error: {}", code)),
         },
-        TokioRusqliteError::Close((_, err)) => Status::internal(format!("database error: {}", err)),
         _ => Status::internal(format!("database error: {}", err)),
     }
 }
 
-async fn init_db(conn: &Connection) -> Result<(), TokioRusqliteError<RusqliteError>> {
-    conn.call(|conn| {
-        conn.execute_batch(
-            "PRAGMA foreign_keys = ON;
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE,
-                identity_key BLOB NOT NULL,
-                signed_prekey_kind INTEGER NOT NULL,
-                signed_prekey_key BLOB NOT NULL,
-                signed_prekey_signature BLOB NOT NULL,
-                kem_prekey_kind INTEGER NOT NULL,
-                kem_prekey_key BLOB NOT NULL,
-                kem_prekey_signature BLOB NOT NULL,
-                signed_prekey_created_at INTEGER
-            );
+fn init_db(conn: &Connection) -> Result<(), RusqliteError> {
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            identity_key BLOB NOT NULL,
+            signed_prekey_kind INTEGER NOT NULL,
+            signed_prekey_key BLOB NOT NULL,
+            signed_prekey_signature BLOB NOT NULL,
+            kem_prekey_kind INTEGER NOT NULL,
+            kem_prekey_key BLOB NOT NULL,
+            kem_prekey_signature BLOB NOT NULL,
+            signed_prekey_created_at INTEGER
+        );
 
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username);
 
-            CREATE TABLE IF NOT EXISTS one_time_prekeys (
-                id INTEGER,
-                user_id INTEGER,
-                kind INTEGER NOT NULL,
-                key BLOB NOT NULL,
-                signature BLOB NOT NULL,
-                created_at INTEGER,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-                PRIMARY KEY (id, user_id)
-            );
+        CREATE TABLE IF NOT EXISTS one_time_prekeys (
+            id INTEGER,
+            user_id INTEGER,
+            kind INTEGER NOT NULL,
+            key BLOB NOT NULL,
+            signature BLOB NOT NULL,
+            created_at INTEGER,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            PRIMARY KEY (id, user_id)
+        );
 
-            CREATE TABLE IF NOT EXISTS one_time_kem_keys (
-                id INTEGER,
-                user_id INTEGER,
-                kind INTEGER NOT NULL,
-                key BLOB NOT NULL,
-                signature BLOB NOT NULL,
-                created_at INTEGER,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-                PRIMARY KEY (id, user_id)
-            );",
-        )?;
-        Ok::<(), RusqliteError>(())
-    })
-    .await
+        CREATE TABLE IF NOT EXISTS one_time_kem_keys (
+            id INTEGER,
+            user_id INTEGER,
+            kind INTEGER NOT NULL,
+            key BLOB NOT NULL,
+            signature BLOB NOT NULL,
+            created_at INTEGER,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            PRIMARY KEY (id, user_id)
+        );",
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
 impl ServerStore {
     async fn count_users_and_prekeys(&self) -> Result<(i64, i64), Status> {
-        let db = Arc::clone(&self.db);
-        let counts = db
-            .call(|conn| {
-                let user_count: i64 =
-                    conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
-                let prekey_count: i64 =
-                    conn.query_row("SELECT COUNT(*) FROM one_time_prekeys", [], |row| {
-                        row.get(0)
-                    })?;
-                Ok::<(i64, i64), RusqliteError>((user_count, prekey_count))
-            })
-            .await
+        let conn = self
+            .db
+            .lock()
+            .map_err(|_| Status::internal("database lock poisoned"))?;
+        let user_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
             .map_err(map_db_error)?;
+        let prekey_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM one_time_prekeys", [], |row| row.get(0))
+            .map_err(map_db_error)?;
+        let counts = (user_count, prekey_count);
         Ok(counts)
     }
 
     async fn count_one_time_keys(&self) -> Result<(i64, i64), Status> {
-        let db = Arc::clone(&self.db);
-        let counts = db
-            .call(|conn| {
-                let prekey_count: i64 =
-                    conn.query_row("SELECT COUNT(*) FROM one_time_prekeys", [], |row| {
-                        row.get(0)
-                    })?;
-                let kem_count: i64 =
-                    conn.query_row("SELECT COUNT(*) FROM one_time_kem_keys", [], |row| {
-                        row.get(0)
-                    })?;
-                Ok::<(i64, i64), RusqliteError>((prekey_count, kem_count))
-            })
-            .await
+        let conn = self
+            .db
+            .lock()
+            .map_err(|_| Status::internal("database lock poisoned"))?;
+        let prekey_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM one_time_prekeys", [], |row| row.get(0))
             .map_err(map_db_error)?;
+        let kem_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM one_time_kem_keys", [], |row| row.get(0))
+            .map_err(map_db_error)?;
+        let counts = (prekey_count, kem_count);
         Ok(counts)
     }
 }
@@ -847,13 +825,13 @@ mod tests {
     }
 
     async fn test_service() -> NewspeakService {
-        let db = Connection::open(":memory:").await.unwrap();
-        init_db(&db).await.unwrap();
-        let db = Arc::new(db);
+        let db = Connection::open(":memory:").unwrap();
+        init_db(&db).unwrap();
+        let db = Arc::new(StdMutex::new(db));
         NewspeakService {
             users: Arc::new(DashMap::new()),
             server_store: ServerStore::new(db),
-            auth_challenges: Arc::new(Mutex::new(HashMap::new())),
+            auth_challenges: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
@@ -1063,13 +1041,13 @@ mod tests {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:10000".parse()?;
-    let db = Connection::open("server_newspeak.db").await?;
-    init_db(&db).await?;
-    let db = Arc::new(db);
+    let db = Connection::open("server_newspeak.db")?;
+    init_db(&db)?;
+    let db = Arc::new(StdMutex::new(db));
     let svc = NewspeakService {
         users: Arc::new(DashMap::new()),
         server_store: ServerStore::new(db),
-        auth_challenges: Arc::new(Mutex::new(HashMap::new())),
+        auth_challenges: Arc::new(AsyncMutex::new(HashMap::new())),
     };
 
     println!("NewspeakServer listening on {}", addr);

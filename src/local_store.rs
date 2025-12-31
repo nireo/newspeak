@@ -1,12 +1,10 @@
 use anyhow::{Result, anyhow};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::Signer;
 use ml_kem::{Encoded, EncodedSizeUser, MlKem1024Params, kem::DecapsulationKey};
-use tokio_rusqlite::Connection;
-use tokio_rusqlite::Error as TokioRusqliteError;
-use tokio_rusqlite::rusqlite::{Error as RusqliteError, OptionalExtension, params};
+use rusqlite::{Connection, Error as RusqliteError, OptionalExtension, params};
 use x25519_dalek as x25519;
 
 use crate::pqxdh;
@@ -23,7 +21,7 @@ pub struct ConversationMessage {
 
 #[derive(Clone)]
 pub struct LocalStorage {
-    db: Arc<Connection>,
+    db: Arc<Mutex<Connection>>,
 }
 
 struct StoredUser {
@@ -41,10 +39,12 @@ impl LocalStorage {
 
     pub async fn new_with_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let db = Connection::open(path).await?;
-        Self::init_migrations(&db).await?;
+        let db = Connection::open(path)?;
+        Self::init_migrations(&db)?;
 
-        Ok(LocalStorage { db: Arc::new(db) })
+        Ok(LocalStorage {
+            db: Arc::new(Mutex::new(db)),
+        })
     }
 
     pub async fn load_or_create_user(&self, username: &str) -> Result<pqxdh::KeyExchangeUser> {
@@ -63,26 +63,26 @@ impl LocalStorage {
     }
 
     async fn load_user(&self, username: &str) -> Result<Option<StoredUser>> {
-        let db = Arc::clone(&self.db);
         let username_owned = username.to_string();
-        let row = db
-            .call(move |conn| {
-                conn.query_row(
-                    "SELECT identity_sk, signed_prekey_sk, kem_decap
-                     FROM local_users
-                     WHERE username = ?1",
-                    params![username_owned],
-                    |row| {
-                        let identity_sk: Vec<u8> = row.get(0)?;
-                        let signed_prekey_sk: Vec<u8> = row.get(1)?;
-                        let kem_decap: Vec<u8> = row.get(2)?;
-                        Ok((identity_sk, signed_prekey_sk, kem_decap))
-                    },
-                )
-                .optional()
-            })
-            .await
-            .map_err(|err| anyhow!(err))?;
+        let row = {
+            let conn = self
+                .db
+                .lock()
+                .map_err(|_| anyhow!("database lock poisoned"))?;
+            conn.query_row(
+                "SELECT identity_sk, signed_prekey_sk, kem_decap
+                 FROM local_users
+                 WHERE username = ?1",
+                params![username_owned],
+                |row| {
+                    let identity_sk: Vec<u8> = row.get(0)?;
+                    let signed_prekey_sk: Vec<u8> = row.get(1)?;
+                    let kem_decap: Vec<u8> = row.get(2)?;
+                    Ok((identity_sk, signed_prekey_sk, kem_decap))
+                },
+            )
+            .optional()?
+        };
 
         let Some((identity_sk, signed_prekey_sk, kem_decap)) = row else {
             return Ok(None);
@@ -101,24 +101,24 @@ impl LocalStorage {
     }
 
     async fn load_identity_sk(&self, username: &str) -> Result<Option<[u8; 32]>> {
-        let db = Arc::clone(&self.db);
         let username = username.to_string();
-        let row = db
-            .call(move |conn| {
-                conn.query_row(
-                    "SELECT identity_sk
-                     FROM local_users
-                     WHERE username = ?1",
-                    params![username],
-                    |row| {
-                        let identity_sk: Vec<u8> = row.get(0)?;
-                        Ok(identity_sk)
-                    },
-                )
-                .optional()
-            })
-            .await
-            .map_err(|err| anyhow!(err))?;
+        let row = {
+            let conn = self
+                .db
+                .lock()
+                .map_err(|_| anyhow!("database lock poisoned"))?;
+            conn.query_row(
+                "SELECT identity_sk
+                 FROM local_users
+                 WHERE username = ?1",
+                params![username],
+                |row| {
+                    let identity_sk: Vec<u8> = row.get(0)?;
+                    Ok(identity_sk)
+                },
+            )
+            .optional()?
+        };
 
         let Some(identity_sk) = row else {
             return Ok(None);
@@ -136,10 +136,13 @@ impl LocalStorage {
             .as_bytes()
             .as_slice()
             .to_vec();
-        let db = Arc::clone(&self.db);
         let username_owned = username.to_string();
 
-        db.call(move |conn| {
+        {
+            let mut conn = self
+                .db
+                .lock()
+                .map_err(|_| anyhow!("database lock poisoned"))?;
             let tx = conn.transaction()?;
             tx.execute(
                 "INSERT INTO local_users (
@@ -151,10 +154,7 @@ impl LocalStorage {
                 params![username_owned, identity_sk, signed_prekey_sk, kem_decap],
             )?;
             tx.commit()?;
-            Ok::<(), RusqliteError>(())
-        })
-        .await
-        .map_err(|err| anyhow!(err))?;
+        }
 
         self.insert_kem_keys(&username, &user.one_time_kem_keys)
             .await?;
@@ -181,10 +181,13 @@ impl LocalStorage {
                 )
             })
             .collect();
-        let db = Arc::clone(&self.db);
         let username = username.to_string();
 
-        db.call(move |conn| {
+        {
+            let mut conn = self
+                .db
+                .lock()
+                .map_err(|_| anyhow!("database lock poisoned"))?;
             let tx = conn.transaction()?;
             {
                 let mut stmt = tx.prepare(
@@ -200,10 +203,7 @@ impl LocalStorage {
                 }
             }
             tx.commit()?;
-            Ok::<(), RusqliteError>(())
-        })
-        .await
-        .map_err(|err| anyhow!(err))?;
+        }
 
         Ok(())
     }
@@ -226,10 +226,13 @@ impl LocalStorage {
                 )
             })
             .collect();
-        let db = Arc::clone(&self.db);
         let username = username.to_string();
 
-        db.call(move |conn| {
+        {
+            let mut conn = self
+                .db
+                .lock()
+                .map_err(|_| anyhow!("database lock poisoned"))?;
             let tx = conn.transaction()?;
             {
                 let mut stmt = tx.prepare(
@@ -245,10 +248,7 @@ impl LocalStorage {
                 }
             }
             tx.commit()?;
-            Ok::<(), RusqliteError>(())
-        })
-        .await
-        .map_err(|err| anyhow!(err))?;
+        }
 
         Ok(())
     }
@@ -262,29 +262,29 @@ impl LocalStorage {
             return Ok(key_store);
         };
         let identity_sk = ed25519_dalek::SigningKey::from_bytes(&identity_sk_bytes);
-        let db = Arc::clone(&self.db);
         let username = username.to_string();
-        let rows = db
-            .call(move |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT id, decap, used
-                    FROM kem_keys
-                    WHERE username = ?1",
-                )?;
-                let rows = stmt.query_map(params![username], |row| {
-                    let id: Vec<u8> = row.get(0)?;
-                    let decap: Vec<u8> = row.get(1)?;
-                    let used: i64 = row.get(2)?;
-                    Ok((id, decap, used))
-                })?;
-                let mut results = Vec::new();
-                for row in rows {
-                    results.push(row?);
-                }
-                Ok::<_, RusqliteError>(results)
-            })
-            .await
-            .map_err(|err| anyhow!(err))?;
+        let rows = {
+            let conn = self
+                .db
+                .lock()
+                .map_err(|_| anyhow!("database lock poisoned"))?;
+            let mut stmt = conn.prepare(
+                "SELECT id, decap, used
+                FROM kem_keys
+                WHERE username = ?1",
+            )?;
+            let rows = stmt.query_map(params![username], |row| {
+                let id: Vec<u8> = row.get(0)?;
+                let decap: Vec<u8> = row.get(1)?;
+                let used: i64 = row.get(2)?;
+                Ok((id, decap, used))
+            })?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            results
+        };
 
         for (id_bytes, decap, used) in rows {
             let id = bytes_to_16(&id_bytes)?;
@@ -316,29 +316,29 @@ impl LocalStorage {
             return Ok(key_store);
         };
         let identity_sk = ed25519_dalek::SigningKey::from_bytes(&identity_sk_bytes);
-        let db = Arc::clone(&self.db);
         let username = username.to_string();
-        let rows = db
-            .call(move |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT id, sk, used
-                    FROM ec_keys
-                    WHERE username = ?1",
-                )?;
-                let rows = stmt.query_map(params![username], |row| {
-                    let id: i64 = row.get(0)?;
-                    let sk: Vec<u8> = row.get(1)?;
-                    let used: i64 = row.get(2)?;
-                    Ok((id, sk, used))
-                })?;
-                let mut results = Vec::new();
-                for row in rows {
-                    results.push(row?);
-                }
-                Ok::<_, RusqliteError>(results)
-            })
-            .await
-            .map_err(|err| anyhow!(err))?;
+        let rows = {
+            let conn = self
+                .db
+                .lock()
+                .map_err(|_| anyhow!("database lock poisoned"))?;
+            let mut stmt = conn.prepare(
+                "SELECT id, sk, used
+                FROM ec_keys
+                WHERE username = ?1",
+            )?;
+            let rows = stmt.query_map(params![username], |row| {
+                let id: i64 = row.get(0)?;
+                let sk: Vec<u8> = row.get(1)?;
+                let used: i64 = row.get(2)?;
+                Ok((id, sk, used))
+            })?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            results
+        };
 
         for (id, sk, used) in rows {
             let id: u32 = id
@@ -367,25 +367,25 @@ impl LocalStorage {
         username: &str,
         peer: &str,
     ) -> Result<Option<RatchetState>> {
-        let db = Arc::clone(&self.db);
         let username = username.to_string();
         let peer = peer.to_string();
-        let row = db
-            .call(move |conn| {
-                conn.query_row(
-                    "SELECT ratchet_state
-                     FROM conversations
-                     WHERE username = ?1 AND peer = ?2",
-                    params![username, peer],
-                    |row| {
-                        let ratchet_state: Vec<u8> = row.get(0)?;
-                        Ok(ratchet_state)
-                    },
-                )
-                .optional()
-            })
-            .await
-            .map_err(|err| anyhow!(err))?;
+        let row = {
+            let conn = self
+                .db
+                .lock()
+                .map_err(|_| anyhow!("database lock poisoned"))?;
+            conn.query_row(
+                "SELECT ratchet_state
+                 FROM conversations
+                 WHERE username = ?1 AND peer = ?2",
+                params![username, peer],
+                |row| {
+                    let ratchet_state: Vec<u8> = row.get(0)?;
+                    Ok(ratchet_state)
+                },
+            )
+            .optional()?
+        };
 
         let Some(ratchet_state) = row else {
             return Ok(None);
@@ -401,11 +401,14 @@ impl LocalStorage {
         ratchet_state: &RatchetState,
     ) -> Result<()> {
         let ratchet_state = ratchet_state_to_bytes(ratchet_state);
-        let db = Arc::clone(&self.db);
         let username = username.to_string();
         let peer = peer.to_string();
 
-        db.call(move |conn| {
+        {
+            let mut conn = self
+                .db
+                .lock()
+                .map_err(|_| anyhow!("database lock poisoned"))?;
             let tx = conn.transaction()?;
             tx.execute(
                 "INSERT INTO conversations (
@@ -418,10 +421,7 @@ impl LocalStorage {
                 params![username, peer, ratchet_state],
             )?;
             tx.commit()?;
-            Ok::<(), RusqliteError>(())
-        })
-        .await
-        .map_err(|err| anyhow!(err))?;
+        }
 
         Ok(())
     }
@@ -437,11 +437,14 @@ impl LocalStorage {
             .get_conversation_id(username, peer)
             .await?
             .ok_or_else(|| anyhow!("conversation not found"))?;
-        let db = Arc::clone(&self.db);
         let content = content.to_string();
         let is_sender = if is_sender { 1 } else { 0 };
 
-        db.call(move |conn| {
+        {
+            let mut conn = self
+                .db
+                .lock()
+                .map_err(|_| anyhow!("database lock poisoned"))?;
             let tx = conn.transaction()?;
             tx.execute(
                 "INSERT INTO messages (
@@ -452,10 +455,7 @@ impl LocalStorage {
                 params![conversation_id, content, is_sender],
             )?;
             tx.commit()?;
-            Ok::<(), RusqliteError>(())
-        })
-        .await
-        .map_err(|err| anyhow!(err))?;
+        }
 
         Ok(())
     }
@@ -468,29 +468,28 @@ impl LocalStorage {
         let Some(conversation_id) = self.get_conversation_id(username, peer).await? else {
             return Ok(Vec::new());
         };
-        let db = Arc::clone(&self.db);
-
-        let rows = db
-            .call(move |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT content, is_sender
-                     FROM messages
-                     WHERE conversation_id = ?1
-                     ORDER BY id ASC",
-                )?;
-                let rows = stmt.query_map(params![conversation_id], |row| {
-                    let content: String = row.get(0)?;
-                    let is_sender: i64 = row.get(1)?;
-                    Ok((content, is_sender))
-                })?;
-                let mut results = Vec::new();
-                for row in rows {
-                    results.push(row?);
-                }
-                Ok::<_, RusqliteError>(results)
-            })
-            .await
-            .map_err(|err| anyhow!(err))?;
+        let rows = {
+            let conn = self
+                .db
+                .lock()
+                .map_err(|_| anyhow!("database lock poisoned"))?;
+            let mut stmt = conn.prepare(
+                "SELECT content, is_sender
+                 FROM messages
+                 WHERE conversation_id = ?1
+                 ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map(params![conversation_id], |row| {
+                let content: String = row.get(0)?;
+                let is_sender: i64 = row.get(1)?;
+                Ok((content, is_sender))
+            })?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            results
+        };
 
         let messages = rows
             .into_iter()
@@ -504,53 +503,53 @@ impl LocalStorage {
     }
 
     async fn get_conversation_id(&self, username: &str, peer: &str) -> Result<Option<i64>> {
-        let db = Arc::clone(&self.db);
         let username = username.to_string();
         let peer = peer.to_string();
-        let row = db
-            .call(move |conn| {
-                conn.query_row(
-                    "SELECT id
-                     FROM conversations
-                     WHERE username = ?1 AND peer = ?2",
-                    params![username, peer],
-                    |row| row.get(0),
-                )
-                .optional()
-            })
-            .await
-            .map_err(|err| anyhow!(err))?;
+        let row = {
+            let conn = self
+                .db
+                .lock()
+                .map_err(|_| anyhow!("database lock poisoned"))?;
+            conn.query_row(
+                "SELECT id
+                 FROM conversations
+                 WHERE username = ?1 AND peer = ?2",
+                params![username, peer],
+                |row| row.get(0),
+            )
+            .optional()?
+        };
 
         Ok(row)
     }
 
     pub async fn get_user_conversations(&self, username: &str) -> Result<Vec<String>> {
-        let db = Arc::clone(&self.db);
         let username = username.to_string();
-        let rows = db
-            .call(move |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT peer
-                     FROM conversations
-                     WHERE username = ?1",
-                )?;
-                let rows = stmt.query_map(params![username], |row| {
-                    let peer: String = row.get(0)?;
-                    Ok(peer)
-                })?;
-                let mut results = Vec::new();
-                for row in rows {
-                    results.push(row?);
-                }
-                Ok::<_, RusqliteError>(results)
-            })
-            .await
-            .map_err(|err| anyhow!(err))?;
+        let rows = {
+            let conn = self
+                .db
+                .lock()
+                .map_err(|_| anyhow!("database lock poisoned"))?;
+            let mut stmt = conn.prepare(
+                "SELECT peer
+                 FROM conversations
+                 WHERE username = ?1",
+            )?;
+            let rows = stmt.query_map(params![username], |row| {
+                let peer: String = row.get(0)?;
+                Ok(peer)
+            })?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            results
+        };
 
         Ok(rows)
     }
 
-    async fn init_migrations(conn: &Connection) -> Result<(), TokioRusqliteError<RusqliteError>> {
+    fn init_migrations(conn: &Connection) -> Result<(), RusqliteError> {
         // some thoughts on the schema: for a relational format it makes more sense to store the
         // user like this, overall sqlite is very reliable and a good also for internal storage in
         // my opinion.
@@ -563,57 +562,54 @@ impl LocalStorage {
         // TODO: might be easier to store all content as bytes blos and deserialize on load,
         //       but that would make queries harder if we want to do anything more complex later on
 
-        conn.call(|conn| {
-            conn.execute_batch(
-                "PRAGMA foreign_keys = ON;
-                CREATE TABLE IF NOT EXISTS local_users (
-                    username TEXT NOT NULL PRIMARY KEY,
-                    identity_sk BLOB NOT NULL,
-                    signed_prekey_sk BLOB NOT NULL,
-                    kem_decap BLOB NOT NULL
-                );
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+            CREATE TABLE IF NOT EXISTS local_users (
+                username TEXT NOT NULL PRIMARY KEY,
+                identity_sk BLOB NOT NULL,
+                signed_prekey_sk BLOB NOT NULL,
+                kem_decap BLOB NOT NULL
+            );
 
-                CREATE TABLE IF NOT EXISTS kem_keys(
-                    id BLOB PRIMARY KEY,
-                    username TEXT NOT NULL,
-                    decap BLOB NOT NULL,
-                    used INTEGER NOT NULL,
-                    FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
-                );
+            CREATE TABLE IF NOT EXISTS kem_keys(
+                id BLOB PRIMARY KEY,
+                username TEXT NOT NULL,
+                decap BLOB NOT NULL,
+                used INTEGER NOT NULL,
+                FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
+            );
 
-                CREATE TABLE IF NOT EXISTS ec_keys(
-                    id INTEGER PRIMARY KEY,
-                    username TEXT NOT NULL,
-                    sk BLOB NOT NULL,
-                    used INTEGER NOT NULL,
-                    FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
-                );",
-            )?;
+            CREATE TABLE IF NOT EXISTS ec_keys(
+                id INTEGER PRIMARY KEY,
+                username TEXT NOT NULL,
+                sk BLOB NOT NULL,
+                used INTEGER NOT NULL,
+                FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
+            );",
+        )?;
 
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS conversations(
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        username TEXT NOT NULL,
-                        peer TEXT NOT NULL,
-                        ratchet_state BLOB NOT NULL,
-                        UNIQUE (username, peer),
-                        FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
-                    );",
-            )?;
-
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS messages(
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS conversations(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    conversation_id INTEGER NOT NULL,
-                    content TEXT NOT NULL,
-                    is_sender INTEGER NOT NULL,
-                    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+                    username TEXT NOT NULL,
+                    peer TEXT NOT NULL,
+                    ratchet_state BLOB NOT NULL,
+                    UNIQUE (username, peer),
+                    FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
                 );",
-            )?;
+        )?;
 
-            Ok::<(), RusqliteError>(())
-        })
-        .await
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS messages(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                is_sender INTEGER NOT NULL,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+            );",
+        )?;
+
+        Ok(())
     }
 }
 
