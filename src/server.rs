@@ -3,21 +3,21 @@ pub mod newspeak {
 }
 
 use blake3;
+use dashmap::DashMap;
 use ed25519_dalek::{VerifyingKey, ed25519};
 use newspeak::newspeak_server::{Newspeak, NewspeakServer};
 use newspeak::{
     FetchPrekeyBundleRequest, FetchPrekeyBundleResponse, PrekeyBundle, RegisterRequest,
     RegisterResponse, SignedPrekey,
 };
+use rusqlite::{self, Connection, Error as RusqliteError, OptionalExtension, params};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::time::{self, Duration, Instant};
-use rusqlite::{self, Connection, Error as RusqliteError, OptionalExtension, params};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
-use tonic::{Request, Response, Status, Streaming};
-use dashmap::DashMap;
+use tonic::{Code, Request, Response, Status, Streaming};
 
 use crate::newspeak::{
     AddSignedPrekeysRequest, AddSignedPrekeysResponse, ClientMessage, JoinResponse, ServerMessage,
@@ -216,11 +216,13 @@ impl NewspeakService {
     }
 }
 
+#[derive(Debug)]
 struct StoredPrekey {
     id: i64,
     prekey: SignedPrekey,
 }
 
+#[derive(Debug)]
 struct ServerUser {
     id: Option<i64>,
     username: String,
@@ -274,8 +276,9 @@ impl ServerStore {
         let user_id = tx.last_insert_rowid();
 
         for prekey in user.one_time_prekeys {
-            insert_one_time_key(&tx, "one_time_prekeys", user_id, prekey.id, &prekey.prekey)
-                .map_err(map_db_error)?;
+            let _ =
+                insert_one_time_key(&tx, "one_time_prekeys", user_id, prekey.id, &prekey.prekey)
+                    .map_err(map_db_error)?;
         }
         tx.commit().map_err(map_db_error)?;
         Ok(())
@@ -582,36 +585,49 @@ impl Newspeak for NewspeakService {
         if request.username.is_empty() {
             return Err(Status::invalid_argument("username is required"));
         }
-        let signed_prekey = request
-            .signed_prekey
-            .ok_or_else(|| Status::invalid_argument("signed_prekey is required"))?;
-        let kem_prekey = request
-            .kem_prekey
-            .ok_or_else(|| Status::invalid_argument("kem_prekey is required"))?;
 
         let username = request.username;
-        let challenge_username = username.clone();
-        let identity_key = request.identity_key;
-        let one_time_prekeys = request
-            .one_time_prekeys
-            .into_iter()
-            .map(|prekey| StoredPrekey {
-                id: i64::from(prekey.id),
-                prekey,
-            })
-            .collect();
 
-        let server_user = ServerUser {
-            id: None,
-            username,
-            identity_key,
-            signed_prekey,
-            kem_prekey,
-            one_time_prekeys,
-        };
-        self.server_store.insert_user(server_user).await?;
+        // if there is a user ignore the insert, if there is one we should just generate the auth
+        // challenge. don't know if this is the best idea to have two uses for this route, but it's
+        // easier this way.
+        let existing_user = self.server_store.get_user(username.clone()).await;
+        if let Err(e) = existing_user {
+            // check if something else went wrong
+            if e.code() != Code::NotFound {
+                return Err(e);
+            }
 
-        let challenge = self.create_auth_challenge(challenge_username).await;
+            let signed_prekey = request
+                .signed_prekey
+                .ok_or_else(|| Status::invalid_argument("signed_prekey is required"))?;
+            let kem_prekey = request
+                .kem_prekey
+                .ok_or_else(|| Status::invalid_argument("kem_prekey is required"))?;
+
+            let identity_key = request.identity_key;
+            let one_time_prekeys = request
+                .one_time_prekeys
+                .into_iter()
+                .map(|prekey| StoredPrekey {
+                    id: i64::from(prekey.id),
+                    prekey,
+                })
+                .collect();
+
+            let server_user = ServerUser {
+                id: None,
+                username: username.clone(),
+                identity_key,
+                signed_prekey,
+                kem_prekey,
+                one_time_prekeys,
+            };
+
+            self.server_store.insert_user(server_user).await?;
+        }
+
+        let challenge = self.create_auth_challenge(username).await;
         let reply = RegisterResponse {
             auth_challenge: challenge.data.to_vec(),
         };
@@ -625,9 +641,9 @@ fn insert_one_time_key(
     user_id: i64,
     id: i64,
     prekey: &SignedPrekey,
-) -> Result<(), RusqliteError> {
+) -> Result<i32, RusqliteError> {
     let sql = format!(
-        "INSERT INTO {} (
+        "INSERT OR IGNORE INTO {} (
             id,
             user_id,
             kind,
@@ -637,11 +653,11 @@ fn insert_one_time_key(
         table
     );
 
-    tx.execute(
+    let rows = tx.execute(
         &sql,
         params![id, user_id, prekey.kind, prekey.key, prekey.signature],
     )?;
-    Ok(())
+    Ok(i32::try_from(rows).unwrap_or(0))
 }
 
 fn insert_one_time_keys(
@@ -652,8 +668,7 @@ fn insert_one_time_keys(
 ) -> Result<i32, RusqliteError> {
     let mut count = 0;
     for prekey in prekeys {
-        insert_one_time_key(tx, table, user_id, prekey.id, &prekey.prekey)?;
-        count += 1;
+        count += insert_one_time_key(tx, table, user_id, prekey.id, &prekey.prekey)?;
     }
     Ok(count)
 }
@@ -777,7 +792,9 @@ impl ServerStore {
             .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
             .map_err(map_db_error)?;
         let prekey_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM one_time_prekeys", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM one_time_prekeys", [], |row| {
+                row.get(0)
+            })
             .map_err(map_db_error)?;
         let counts = (user_count, prekey_count);
         Ok(counts)
@@ -789,10 +806,14 @@ impl ServerStore {
             .lock()
             .map_err(|_| Status::internal("database lock poisoned"))?;
         let prekey_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM one_time_prekeys", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM one_time_prekeys", [], |row| {
+                row.get(0)
+            })
             .map_err(map_db_error)?;
         let kem_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM one_time_kem_keys", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM one_time_kem_keys", [], |row| {
+                row.get(0)
+            })
             .map_err(map_db_error)?;
         let counts = (prekey_count, kem_count);
         Ok(counts)

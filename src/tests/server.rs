@@ -51,7 +51,7 @@ async fn register_persists_keys() {
 }
 
 #[tokio::test]
-async fn register_rejects_duplicate_username() {
+async fn register_is_idempotent_for_existing_username() {
     let svc = test_service().await;
     let request = RegisterRequest {
         username: "bob".to_string(),
@@ -62,8 +62,8 @@ async fn register_rejects_duplicate_username() {
     };
 
     svc.register(Request::new(request.clone())).await.unwrap();
-    let err = svc.register(Request::new(request)).await.unwrap_err();
-    assert_eq!(err.code(), Code::AlreadyExists);
+    let response = svc.register(Request::new(request)).await.unwrap();
+    assert_eq!(response.into_inner().auth_challenge.len(), 32);
 }
 
 #[tokio::test]
@@ -161,6 +161,47 @@ async fn one_time_prekey_ids_are_scoped_per_user() {
         .unwrap();
     assert_eq!(bob_bundle.one_time_prekey_id, Some(bob_id));
     assert_eq!(bob_bundle.one_time_prekey.unwrap().key, vec![23]);
+}
+
+#[tokio::test]
+async fn add_one_time_prekeys_ignores_duplicates() {
+    let svc = test_service().await;
+    let request = RegisterRequest {
+        username: "dana".to_string(),
+        identity_key: vec![1],
+        signed_prekey: Some(sample_prekey(KeyKind::X25519, &[2], &[3])),
+        one_time_prekeys: vec![sample_prekey_with_id(KeyKind::X25519, &[4], &[5], 1)],
+        kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[6], &[7])),
+    };
+
+    svc.register(Request::new(request)).await.unwrap();
+    let user = svc
+        .server_store
+        .get_user("dana".to_string())
+        .await
+        .unwrap();
+    let user_id = user.id.unwrap();
+
+    let prekeys = vec![
+        StoredPrekey {
+            id: 1,
+            prekey: sample_prekey_with_id(KeyKind::X25519, &[8], &[9], 1),
+        },
+        StoredPrekey {
+            id: 2,
+            prekey: sample_prekey_with_id(KeyKind::X25519, &[10], &[11], 2),
+        },
+    ];
+
+    let count = svc
+        .server_store
+        .add_one_time_prekeys(user_id, prekeys, vec![])
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let counts = svc.server_store.count_one_time_keys().await.unwrap();
+    assert_eq!(counts, (2, 0));
 }
 
 #[tokio::test]

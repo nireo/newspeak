@@ -130,6 +130,7 @@ impl<'a> User<'a> {
                 })
                 .await?;
         }
+
         Ok(())
     }
 
