@@ -60,3 +60,19 @@ fn ratchet_rejects_message_with_wrong_additional_data() {
     let message = alice.send_message("secret", b"correct-ad").unwrap();
     bob.receive_message(message, b"incorrect-ad").unwrap();
 }
+
+#[test]
+fn ratchet_rejects_message_with_tampered_counter() {
+    let shared_key: [u8; 32] = rand::random();
+    let mut alice = RatchetState::new();
+    let mut bob = RatchetState::new();
+
+    let bob_pk = ecdh::PublicKey::from(&bob.sending_sk);
+    alice.as_initiator(shared_key, bob_pk);
+    bob.as_receiver(shared_key);
+
+    let ad = b"ratchet-ad";
+    let mut message = alice.send_message("secret", ad).unwrap();
+    message.header.counter += 1;
+    assert!(bob.receive_message(message, ad).is_err());
+}

@@ -29,6 +29,15 @@ pub struct RatchetMessage {
     pub ciphertext: Vec<u8>,
 }
 
+fn header_aad(aditionnal_data: &[u8], header: &RatchetMessageHeader) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(aditionnal_data.len() + 52);
+    aad.extend_from_slice(aditionnal_data);
+    aad.extend_from_slice(header.pk.as_bytes());
+    aad.extend_from_slice(&header.counter.to_le_bytes());
+    aad.extend_from_slice(&header.nonce);
+    aad
+}
+
 impl RatchetState {
     pub fn new() -> RatchetState {
         let mut rng = rand::thread_rng();
@@ -82,12 +91,13 @@ impl RatchetState {
 
         // ENCRYPT(mk, plaintext, AD || header)
         let mut cipher = ChaCha20Poly1305::new(&message_key.try_into()?);
+        let aad = header_aad(aditionnal_data, &header);
         let ciphertext = cipher
             .encrypt(
                 (&nonce).into(),
                 Payload {
                     msg: message.as_bytes(),
-                    aad: aditionnal_data,
+                    aad: &aad,
                 },
             )
             .map_err(|e| anyhow!("failed to encrypt message: {}", e.to_string()))?;
@@ -131,12 +141,13 @@ impl RatchetState {
 
         //  DECRYPT(mk, ciphertext, CONCAT(AD, header))
         let mut cipher = ChaCha20Poly1305::new(&message_key.try_into()?);
+        let aad = header_aad(aditionnal_data, &message.header);
         let plaintext = cipher
             .decrypt(
                 (&message.header.nonce).into(),
                 Payload {
                     msg: &message.ciphertext,
-                    aad: aditionnal_data,
+                    aad: &aad,
                 },
             )
             .map_err(|e| anyhow!("failed to decrypt message: {}", e.to_string()))?;
