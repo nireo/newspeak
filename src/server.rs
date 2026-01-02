@@ -14,6 +14,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{self, Row, Sqlite, SqlitePool};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::time::{self, Duration, Instant};
 use tokio_stream::wrappers::ReceiverStream;
@@ -158,6 +159,9 @@ impl NewspeakService {
                     .await;
                 Ok(())
             }
+            Some(client_message::MessageType::AckOfflineMessages(ack)) => {
+                todo!()
+            }
             None => Err(Status::invalid_argument("missing message type")),
         }
     }
@@ -193,6 +197,7 @@ impl NewspeakService {
                 message_type: Some(server_message::MessageType::JoinResponse(JoinResponse {
                     message: "joined".to_string(),
                     timestamp: None,
+                    offline_messages: Vec::new(), // TODO: fetch offline messages
                 })),
             }))
             .await;
@@ -345,8 +350,84 @@ impl ServerStore {
         })
     }
 
-    fn insert_message(&self, _msg_kind: OfflineMessageKind, _msg_data: &[u8]) -> Result<(), Status> {
-        Err(Status::unimplemented("offline messages not implemented"))
+    async fn insert_message(
+        &self,
+        msg_kind: OfflineMessageKind,
+        msg_data: &[u8],
+        sender_username: &str,
+        receiver_username: &str,
+    ) -> Result<(), Status> {
+        let mut tx = self.db.begin().await.map_err(map_db_error)?;
+
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|e| Status::internal(format!("system time error: {}", e)))?
+            .as_secs() as i64;
+
+        sqlx::query(
+            "INSERT INTO offline_messages (
+                sender_username,
+                receiver_username,
+                message,
+                message_kind,
+                created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(sender_username)
+        .bind(receiver_username)
+        .bind(msg_data)
+        .bind(msg_kind as i32)
+        .bind(timestamp)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+
+        tx.commit().await.map_err(map_db_error)?;
+
+        Ok(())
+    }
+
+    /// delete offline messages received before or at the given timestamp we cannot really delete
+    /// the messages after returning them to the client because if the client crashes or fails to
+    /// ack them we would lose messages.
+    async fn delete_offline_message(&self, received_timestamp: i64) -> Result<(), Status> {
+        let mut tx = self.db.begin().await.map_err(map_db_error)?;
+
+        sqlx::query(
+            "DELETE FROM offline_messages
+            WHERE created_at <= ?1",
+        )
+        .bind(received_timestamp)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+
+        tx.commit().await.map_err(map_db_error)?;
+        Ok(())
+    }
+
+    async fn get_offline_messages(&self, username: &str) -> Result<Vec<(i32, Vec<u8>)>, Status> {
+        let mut tx = self.db.begin().await.map_err(map_db_error)?;
+
+        let rows = sqlx::query(
+            "SELECT id, message
+            FROM offline_messages
+            WHERE receiver_username = ?1",
+        )
+        .bind(username)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+
+        let mut messages = Vec::new();
+        for row in rows {
+            let id: i32 = row.get(0);
+            let message: Vec<u8> = row.get(1);
+            messages.push((id, message));
+        }
+
+        tx.commit().await.map_err(map_db_error)?;
+        Ok(messages)
     }
 
     async fn fetch_prekey_bundle(&self, username: String) -> Result<PrekeyBundle, Status> {
@@ -393,10 +474,9 @@ impl ServerStore {
             id: 0,
         };
 
-        let kem_encap_key =
-            take_one_time_key(&mut tx, "one_time_kem_keys", user_id)
-                .await
-                .map_err(map_db_error)?;
+        let kem_encap_key = take_one_time_key(&mut tx, "one_time_kem_keys", user_id)
+            .await
+            .map_err(map_db_error)?;
         let (kem_encap_key, kem_id) = match kem_encap_key {
             Some(prekey) => {
                 let kem_id = kem_id_from_key(&prekey.prekey.key);
@@ -407,10 +487,9 @@ impl ServerStore {
                 (kem_prekey, kem_id)
             }
         };
-        let one_time_prekey =
-            take_one_time_key(&mut tx, "one_time_prekeys", user_id)
-                .await
-                .map_err(map_db_error)?;
+        let one_time_prekey = take_one_time_key(&mut tx, "one_time_prekeys", user_id)
+            .await
+            .map_err(map_db_error)?;
         let (one_time_prekey, one_time_prekey_id) = match one_time_prekey {
             Some(prekey) => (Some(prekey.prekey), Some(prekey.id as u32)),
             None => (None, None),
@@ -792,7 +871,7 @@ async fn init_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             receiver_username TEXT NOT NULL,
             message BLOB NOT NULL,
             message_kind INTEGER NOT NULL,
-            created_at INTEGER
+            created_at INTEGER NOT NULL
         );",
     )
     .execute(pool)

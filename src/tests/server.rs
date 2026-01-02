@@ -277,3 +277,128 @@ async fn auth_challenge_expires() {
     let guard = svc.auth_challenges.lock().await;
     assert!(!guard.contains_key("erin"));
 }
+
+#[tokio::test]
+async fn offline_messages_are_scoped_to_receiver() {
+    let svc = test_service().await;
+
+    svc.server_store
+        .insert_message(
+            OfflineMessageKind::Regular,
+            b"hello",
+            "alice",
+            "bob",
+        )
+        .await
+        .unwrap();
+    svc.server_store
+        .insert_message(
+            OfflineMessageKind::KeyExchange,
+            b"key-exchange",
+            "carol",
+            "bob",
+        )
+        .await
+        .unwrap();
+    svc.server_store
+        .insert_message(
+            OfflineMessageKind::Regular,
+            b"private",
+            "alice",
+            "dave",
+        )
+        .await
+        .unwrap();
+
+    let mut bob_messages: Vec<Vec<u8>> = svc
+        .server_store
+        .get_offline_messages("bob")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, message)| message)
+        .collect();
+    bob_messages.sort();
+    assert_eq!(bob_messages, vec![b"hello".to_vec(), b"key-exchange".to_vec()]);
+
+    let dave_messages = svc.server_store.get_offline_messages("dave").await.unwrap();
+    assert_eq!(dave_messages.len(), 1);
+    assert_eq!(dave_messages[0].1, b"private".to_vec());
+
+    let empty = svc
+        .server_store
+        .get_offline_messages("missing")
+        .await
+        .unwrap();
+    assert!(empty.is_empty());
+}
+
+#[tokio::test]
+async fn delete_offline_messages_respects_timestamp() {
+    let svc = test_service().await;
+
+    svc.server_store
+        .insert_message(
+            OfflineMessageKind::Regular,
+            b"old",
+            "alice",
+            "bob",
+        )
+        .await
+        .unwrap();
+    svc.server_store
+        .insert_message(
+            OfflineMessageKind::Regular,
+            b"new",
+            "alice",
+            "bob",
+        )
+        .await
+        .unwrap();
+
+    let rows = svc.server_store.get_offline_messages("bob").await.unwrap();
+    assert_eq!(rows.len(), 2);
+
+    let mut old_id = None;
+    let mut new_id = None;
+    for (id, message) in rows {
+        if message == b"old" {
+            old_id = Some(id);
+        } else if message == b"new" {
+            new_id = Some(id);
+        }
+    }
+    assert!(old_id.is_some());
+    assert!(new_id.is_some());
+
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    sqlx::query("UPDATE offline_messages SET created_at = ?1 WHERE id = ?2")
+        .bind(now - 10)
+        .bind(old_id.unwrap())
+        .execute(&svc.server_store.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE offline_messages SET created_at = ?1 WHERE id = ?2")
+        .bind(now + 10)
+        .bind(new_id.unwrap())
+        .execute(&svc.server_store.db)
+        .await
+        .unwrap();
+
+    svc.server_store.delete_offline_message(now).await.unwrap();
+
+    let remaining = svc.server_store.get_offline_messages("bob").await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].1, b"new".to_vec());
+
+    svc.server_store
+        .delete_offline_message(i64::MAX)
+        .await
+        .unwrap();
+    let remaining = svc.server_store.get_offline_messages("bob").await.unwrap();
+    assert!(remaining.is_empty());
+}

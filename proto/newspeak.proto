@@ -32,6 +32,11 @@ message SignedPrekey {
   uint32 id = 4;
 }
 
+message OfflineMessage {
+  google.protobuf.Timestamp timestamp = 1;
+  ClientMessage message = 2;
+}
+
 message PrekeyBundle {
   bytes identity_key = 1;
   SignedPrekey signed_prekey = 2;
@@ -69,6 +74,7 @@ message JoinRequest {
 message JoinResponse {
   string message = 1;
   google.protobuf.Timestamp timestamp = 2;
+  repeated OfflineMessage offline_messages = 3;
 }
 
 message InitialMessage {
@@ -101,11 +107,16 @@ message RatchetMessage {
   bytes nonce = 5;
 }
 
+message AckOfflineMessages {
+  google.protobuf.Timestamp latest_timestamp = 1;
+}
+
 message ClientMessage {
   oneof message_type {
     JoinRequest join_request = 1;
     KeyExchangeMessage key_exchange_message = 2;
     EncryptedMessage encrypted_message = 3;
+    AckOfflineMessages ack_offline_messages = 4;
   }
 }
 
