@@ -22,9 +22,12 @@ fn sample_prekey_with_id(kind: KeyKind, key: &[u8], signature: &[u8], id: u32) -
 }
 
 async fn test_service() -> NewspeakService {
-    let db = Connection::open(":memory:").unwrap();
-    init_db(&db).unwrap();
-    let db = Arc::new(StdMutex::new(db));
+    let db = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    init_db(&db).await.unwrap();
     NewspeakService {
         users: Arc::new(DashMap::new()),
         server_store: ServerStore::new(db),

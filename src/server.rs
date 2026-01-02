@@ -10,9 +10,10 @@ use newspeak::{
     FetchPrekeyBundleRequest, FetchPrekeyBundleResponse, PrekeyBundle, RegisterRequest,
     RegisterResponse, SignedPrekey,
 };
-use rusqlite::{self, Connection, Error as RusqliteError, OptionalExtension, params};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::{self, Row, Sqlite, SqlitePool};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::time::{self, Duration, Instant};
 use tokio_stream::wrappers::ReceiverStream;
@@ -31,6 +32,14 @@ struct AuthChallenge {
 }
 
 const AUTH_CHALLENGE_TTL: Duration = Duration::from_secs(300);
+
+const MESSAGE_KIND_KEY_EXCHANGE: i32 = 1;
+const MESSAGE_KIND_REGULAR: i32 = 2;
+
+enum OfflineMessageKind {
+    KeyExchange = 1,
+    Regular = 2,
+}
 
 #[derive(Clone)]
 struct NewspeakService {
@@ -234,22 +243,17 @@ struct ServerUser {
 
 #[derive(Clone)]
 struct ServerStore {
-    db: Arc<StdMutex<Connection>>,
+    db: SqlitePool,
 }
 
 impl ServerStore {
-    fn new(db: Arc<StdMutex<Connection>>) -> Self {
+    fn new(db: SqlitePool) -> Self {
         Self { db }
     }
 
     async fn insert_user(&self, user: ServerUser) -> Result<(), Status> {
-        let mut conn = self
-            .db
-            .lock()
-            .map_err(|_| Status::internal("database lock poisoned"))?;
-        let tx = conn.transaction().map_err(map_db_error)?;
-
-        tx.execute(
+        let mut tx = self.db.begin().await.map_err(map_db_error)?;
+        let result = sqlx::query(
             "INSERT INTO users (
                 username,
                 identity_key,
@@ -260,144 +264,139 @@ impl ServerStore {
                 kem_prekey_key,
                 kem_prekey_signature
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                user.username,
-                user.identity_key,
-                user.signed_prekey.kind,
-                user.signed_prekey.key,
-                user.signed_prekey.signature,
-                user.kem_prekey.kind,
-                user.kem_prekey.key,
-                user.kem_prekey.signature
-            ],
         )
+        .bind(&user.username)
+        .bind(&user.identity_key)
+        .bind(user.signed_prekey.kind)
+        .bind(&user.signed_prekey.key)
+        .bind(&user.signed_prekey.signature)
+        .bind(user.kem_prekey.kind)
+        .bind(&user.kem_prekey.key)
+        .bind(&user.kem_prekey.signature)
+        .execute(&mut *tx)
+        .await
         .map_err(map_db_error)?;
 
-        let user_id = tx.last_insert_rowid();
+        let user_id = result.last_insert_rowid();
 
         for prekey in user.one_time_prekeys {
-            let _ =
-                insert_one_time_key(&tx, "one_time_prekeys", user_id, prekey.id, &prekey.prekey)
-                    .map_err(map_db_error)?;
+            let _ = insert_one_time_key(
+                &mut tx,
+                "one_time_prekeys",
+                user_id,
+                prekey.id,
+                &prekey.prekey,
+            )
+            .await
+            .map_err(map_db_error)?;
         }
-        tx.commit().map_err(map_db_error)?;
+        tx.commit().await.map_err(map_db_error)?;
         Ok(())
     }
 
     async fn get_user(&self, username: String) -> Result<ServerUser, Status> {
-        let mut conn = self
-            .db
-            .lock()
-            .map_err(|_| Status::internal("database lock poisoned"))?;
-        let tx = conn.transaction().map_err(map_db_error)?;
+        let row = sqlx::query(
+            "SELECT id,
+                    identity_key,
+                    signed_prekey_kind,
+                    signed_prekey_key,
+                    signed_prekey_signature,
+                    kem_prekey_kind,
+                    kem_prekey_key,
+                    kem_prekey_signature
+            FROM users
+            WHERE username = ?1",
+        )
+        .bind(&username)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(map_db_error)?;
 
-        let user_row: Option<ServerUser> = tx
-            .query_row(
-                "SELECT id,
-                        identity_key,
-                        signed_prekey_kind,
-                        signed_prekey_key,
-                        signed_prekey_signature,
-                        kem_prekey_kind,
-                        kem_prekey_key,
-                        kem_prekey_signature
-                FROM users
-                WHERE username = ?1",
-                params![username.as_str()],
-                |row| {
-                    let user_id: i64 = row.get(0)?;
-                    let identity_key: Vec<u8> = row.get(1)?;
-                    let signed_prekey_kind: i32 = row.get(2)?;
-                    let signed_prekey_key: Vec<u8> = row.get(3)?;
-                    let signed_prekey_signature: Vec<u8> = row.get(4)?;
-                    let kem_prekey_kind: i32 = row.get(5)?;
-                    let kem_prekey_key: Vec<u8> = row.get(6)?;
-                    let kem_prekey_signature: Vec<u8> = row.get(7)?;
-                    Ok(ServerUser {
-                        id: Some(user_id),
-                        username: username.to_string(),
-                        identity_key,
-                        signed_prekey: SignedPrekey {
-                            kind: signed_prekey_kind,
-                            key: signed_prekey_key,
-                            signature: signed_prekey_signature,
-                            id: 0,
-                        },
-                        kem_prekey: SignedPrekey {
-                            kind: kem_prekey_kind,
-                            key: kem_prekey_key,
-                            signature: kem_prekey_signature,
-                            id: 0,
-                        },
-                        one_time_prekeys: Vec::new(), // to be filled later
-                    })
-                },
-            )
-            .optional()
-            .map_err(map_db_error)?;
-
-        tx.commit().map_err(map_db_error)?;
-
-        let user = user_row.ok_or_else(|| Status::not_found("username not registered"))?;
-        Ok(user)
-    }
-
-    async fn fetch_prekey_bundle(&self, username: String) -> Result<PrekeyBundle, Status> {
-        let mut conn = self
-            .db
-            .lock()
-            .map_err(|_| Status::internal("database lock poisoned"))?;
-        let tx = conn.transaction().map_err(map_db_error)?;
-
-        let user_row: Option<(i64, Vec<u8>, SignedPrekey, SignedPrekey)> = tx
-            .query_row(
-                "SELECT id,
-                        identity_key,
-                        signed_prekey_kind,
-                        signed_prekey_key,
-                        signed_prekey_signature,
-                        kem_prekey_kind,
-                        kem_prekey_key,
-                        kem_prekey_signature
-                FROM users
-                WHERE username = ?1",
-                params![username.as_str()],
-                |row| {
-                    let user_id: i64 = row.get(0)?;
-                    let identity_key: Vec<u8> = row.get(1)?;
-                    let signed_prekey_kind: i32 = row.get(2)?;
-                    let signed_prekey_key: Vec<u8> = row.get(3)?;
-                    let signed_prekey_signature: Vec<u8> = row.get(4)?;
-                    let kem_prekey_kind: i32 = row.get(5)?;
-                    let kem_prekey_key: Vec<u8> = row.get(6)?;
-                    let kem_prekey_signature: Vec<u8> = row.get(7)?;
-                    Ok((
-                        user_id,
-                        identity_key,
-                        SignedPrekey {
-                            kind: signed_prekey_kind,
-                            key: signed_prekey_key,
-                            signature: signed_prekey_signature,
-                            id: 0,
-                        },
-                        SignedPrekey {
-                            kind: kem_prekey_kind,
-                            key: kem_prekey_key,
-                            signature: kem_prekey_signature,
-                            id: 0,
-                        },
-                    ))
-                },
-            )
-            .optional()
-            .map_err(map_db_error)?;
-
-        let Some((user_id, identity_key, signed_prekey, kem_prekey)) = user_row else {
+        let Some(row) = row else {
             return Err(Status::not_found("username not registered"));
         };
 
+        let user_id: i64 = row.get(0);
+        let identity_key: Vec<u8> = row.get(1);
+        let signed_prekey_kind: i32 = row.get(2);
+        let signed_prekey_key: Vec<u8> = row.get(3);
+        let signed_prekey_signature: Vec<u8> = row.get(4);
+        let kem_prekey_kind: i32 = row.get(5);
+        let kem_prekey_key: Vec<u8> = row.get(6);
+        let kem_prekey_signature: Vec<u8> = row.get(7);
+
+        Ok(ServerUser {
+            id: Some(user_id),
+            username: username.to_string(),
+            identity_key,
+            signed_prekey: SignedPrekey {
+                kind: signed_prekey_kind,
+                key: signed_prekey_key,
+                signature: signed_prekey_signature,
+                id: 0,
+            },
+            kem_prekey: SignedPrekey {
+                kind: kem_prekey_kind,
+                key: kem_prekey_key,
+                signature: kem_prekey_signature,
+                id: 0,
+            },
+            one_time_prekeys: Vec::new(),
+        })
+    }
+
+    fn insert_message(&self, _msg_kind: OfflineMessageKind, _msg_data: &[u8]) -> Result<(), Status> {
+        Err(Status::unimplemented("offline messages not implemented"))
+    }
+
+    async fn fetch_prekey_bundle(&self, username: String) -> Result<PrekeyBundle, Status> {
+        let mut tx = self.db.begin().await.map_err(map_db_error)?;
+        let row = sqlx::query(
+            "SELECT id,
+                    identity_key,
+                    signed_prekey_kind,
+                    signed_prekey_key,
+                    signed_prekey_signature,
+                    kem_prekey_kind,
+                    kem_prekey_key,
+                    kem_prekey_signature
+            FROM users
+            WHERE username = ?1",
+        )
+        .bind(&username)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+
+        let Some(row) = row else {
+            return Err(Status::not_found("username not registered"));
+        };
+
+        let user_id: i64 = row.get(0);
+        let identity_key: Vec<u8> = row.get(1);
+        let signed_prekey_kind: i32 = row.get(2);
+        let signed_prekey_key: Vec<u8> = row.get(3);
+        let signed_prekey_signature: Vec<u8> = row.get(4);
+        let kem_prekey_kind: i32 = row.get(5);
+        let kem_prekey_key: Vec<u8> = row.get(6);
+        let kem_prekey_signature: Vec<u8> = row.get(7);
+        let signed_prekey = SignedPrekey {
+            kind: signed_prekey_kind,
+            key: signed_prekey_key,
+            signature: signed_prekey_signature,
+            id: 0,
+        };
+        let kem_prekey = SignedPrekey {
+            kind: kem_prekey_kind,
+            key: kem_prekey_key,
+            signature: kem_prekey_signature,
+            id: 0,
+        };
+
         let kem_encap_key =
-            take_one_time_key(&tx, "one_time_kem_keys", user_id).map_err(map_db_error)?;
+            take_one_time_key(&mut tx, "one_time_kem_keys", user_id)
+                .await
+                .map_err(map_db_error)?;
         let (kem_encap_key, kem_id) = match kem_encap_key {
             Some(prekey) => {
                 let kem_id = kem_id_from_key(&prekey.prekey.key);
@@ -409,13 +408,15 @@ impl ServerStore {
             }
         };
         let one_time_prekey =
-            take_one_time_key(&tx, "one_time_prekeys", user_id).map_err(map_db_error)?;
+            take_one_time_key(&mut tx, "one_time_prekeys", user_id)
+                .await
+                .map_err(map_db_error)?;
         let (one_time_prekey, one_time_prekey_id) = match one_time_prekey {
             Some(prekey) => (Some(prekey.prekey), Some(prekey.id as u32)),
             None => (None, None),
         };
 
-        tx.commit().map_err(map_db_error)?;
+        tx.commit().await.map_err(map_db_error)?;
 
         Ok(PrekeyBundle {
             identity_key,
@@ -433,13 +434,10 @@ impl ServerStore {
         prekeys: Vec<StoredPrekey>,
         kem_prekeys: Vec<SignedPrekey>,
     ) -> Result<i32, Status> {
-        let mut conn = self
-            .db
-            .lock()
-            .map_err(|_| Status::internal("database lock poisoned"))?;
-        let tx = conn.transaction().map_err(map_db_error)?;
+        let mut tx = self.db.begin().await.map_err(map_db_error)?;
         let mut count = 0;
-        count += insert_one_time_keys(&tx, "one_time_prekeys", user_id, prekeys)
+        count += insert_one_time_keys(&mut tx, "one_time_prekeys", user_id, prekeys)
+            .await
             .map_err(map_db_error)?;
         let kem_prekeys = kem_prekeys
             .into_iter()
@@ -448,9 +446,10 @@ impl ServerStore {
                 prekey,
             })
             .collect();
-        count += insert_one_time_keys(&tx, "one_time_kem_keys", user_id, kem_prekeys)
+        count += insert_one_time_keys(&mut tx, "one_time_kem_keys", user_id, kem_prekeys)
+            .await
             .map_err(map_db_error)?;
-        tx.commit().map_err(map_db_error)?;
+        tx.commit().await.map_err(map_db_error)?;
         Ok(count)
     }
 }
@@ -635,13 +634,13 @@ impl Newspeak for NewspeakService {
     }
 }
 
-fn insert_one_time_key(
-    tx: &rusqlite::Transaction<'_>,
+async fn insert_one_time_key(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
     table: &str,
     user_id: i64,
     id: i64,
     prekey: &SignedPrekey,
-) -> Result<i32, RusqliteError> {
+) -> Result<i32, sqlx::Error> {
     let sql = format!(
         "INSERT OR IGNORE INTO {} (
             id,
@@ -653,31 +652,35 @@ fn insert_one_time_key(
         table
     );
 
-    let rows = tx.execute(
-        &sql,
-        params![id, user_id, prekey.kind, prekey.key, prekey.signature],
-    )?;
-    Ok(i32::try_from(rows).unwrap_or(0))
+    let rows = sqlx::query(&sql)
+        .bind(id)
+        .bind(user_id)
+        .bind(prekey.kind)
+        .bind(&prekey.key)
+        .bind(&prekey.signature)
+        .execute(&mut **tx)
+        .await?;
+    Ok(i32::try_from(rows.rows_affected()).unwrap_or(0))
 }
 
-fn insert_one_time_keys(
-    tx: &rusqlite::Transaction<'_>,
+async fn insert_one_time_keys(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
     table: &str,
     user_id: i64,
     prekeys: Vec<StoredPrekey>,
-) -> Result<i32, RusqliteError> {
+) -> Result<i32, sqlx::Error> {
     let mut count = 0;
     for prekey in prekeys {
-        count += insert_one_time_key(tx, table, user_id, prekey.id, &prekey.prekey)?;
+        count += insert_one_time_key(tx, table, user_id, prekey.id, &prekey.prekey).await?;
     }
     Ok(count)
 }
 
-fn take_one_time_key(
-    tx: &rusqlite::Transaction<'_>,
+async fn take_one_time_key(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
     table: &str,
     user_id: i64,
-) -> Result<Option<StoredPrekey>, RusqliteError> {
+) -> Result<Option<StoredPrekey>, sqlx::Error> {
     let sql = format!(
         "SELECT id, kind, key, signature
         FROM {}
@@ -687,28 +690,29 @@ fn take_one_time_key(
         table
     );
 
-    let row: Option<(i64, SignedPrekey)> = tx
-        .query_row(&sql, params![user_id], |row| {
-            let id: i64 = row.get(0)?;
-            let kind: i32 = row.get(1)?;
-            let key: Vec<u8> = row.get(2)?;
-            let signature: Vec<u8> = row.get(3)?;
-            let prekey_id = u32::try_from(id).unwrap_or(0);
-            Ok((
-                id,
-                SignedPrekey {
-                    kind,
-                    key,
-                    signature,
-                    id: prekey_id,
-                },
-            ))
-        })
-        .optional()?;
+    let row = sqlx::query(&sql)
+        .bind(user_id)
+        .fetch_optional(&mut **tx)
+        .await?;
 
-    if let Some((id, prekey)) = row {
+    if let Some(row) = row {
+        let id: i64 = row.get(0);
+        let kind: i32 = row.get(1);
+        let key: Vec<u8> = row.get(2);
+        let signature: Vec<u8> = row.get(3);
+        let prekey_id = u32::try_from(id).unwrap_or(0);
+        let prekey = SignedPrekey {
+            kind,
+            key,
+            signature,
+            id: prekey_id,
+        };
         let delete_sql = format!("DELETE FROM {} WHERE id = ?1 AND user_id = ?2", table);
-        tx.execute(&delete_sql, params![id, user_id])?;
+        sqlx::query(&delete_sql)
+            .bind(id)
+            .bind(user_id)
+            .execute(&mut **tx)
+            .await?;
         Ok(Some(StoredPrekey { id, prekey }))
     } else {
         Ok(None)
@@ -726,22 +730,30 @@ fn kem_db_id_from_key(key: &[u8]) -> i64 {
     i64::from_le_bytes(bytes)
 }
 
-fn map_db_error(err: RusqliteError) -> Status {
+fn map_db_error(err: sqlx::Error) -> Status {
     match err {
-        RusqliteError::SqliteFailure(code, _) => match code.code {
-            rusqlite::ErrorCode::ConstraintViolation => {
+        sqlx::Error::Database(db_err) => {
+            let code = db_err.code().map(|code| code.to_string());
+            if code.as_deref() == Some("2067")
+                || db_err
+                    .message()
+                    .contains("UNIQUE constraint failed: users.username")
+            {
                 Status::already_exists("username already registered")
+            } else {
+                Status::internal(format!("database error: {}", db_err.message()))
             }
-            _ => Status::internal(format!("database error: {}", code)),
-        },
+        }
         _ => Status::internal(format!("database error: {}", err)),
     }
 }
 
-fn init_db(conn: &Connection) -> Result<(), RusqliteError> {
-    conn.execute_batch(
-        "PRAGMA foreign_keys = ON;
-        CREATE TABLE IF NOT EXISTS users (
+async fn init_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query("PRAGMA foreign_keys = ON;")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL UNIQUE,
             identity_key BLOB NOT NULL,
@@ -752,22 +764,15 @@ fn init_db(conn: &Connection) -> Result<(), RusqliteError> {
             kem_prekey_key BLOB NOT NULL,
             kem_prekey_signature BLOB NOT NULL,
             signed_prekey_created_at INTEGER
-        );
-
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username);
-
-        CREATE TABLE IF NOT EXISTS one_time_prekeys (
-            id INTEGER,
-            user_id INTEGER,
-            kind INTEGER NOT NULL,
-            key BLOB NOT NULL,
-            signature BLOB NOT NULL,
-            created_at INTEGER,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-            PRIMARY KEY (id, user_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS one_time_kem_keys (
+        );",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username);")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS one_time_prekeys (
             id INTEGER,
             user_id INTEGER,
             kind INTEGER NOT NULL,
@@ -777,43 +782,61 @@ fn init_db(conn: &Connection) -> Result<(), RusqliteError> {
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
             PRIMARY KEY (id, user_id)
         );",
-    )?;
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS offline_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_username TEXT NOT NULL,
+            receiver_username TEXT NOT NULL,
+            message BLOB NOT NULL,
+            message_kind INTEGER NOT NULL,
+            created_at INTEGER
+        );",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS one_time_kem_keys (
+            id INTEGER,
+            user_id INTEGER,
+            kind INTEGER NOT NULL,
+            key BLOB NOT NULL,
+            signature BLOB NOT NULL,
+            created_at INTEGER,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            PRIMARY KEY (id, user_id)
+        );",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 #[cfg(test)]
 impl ServerStore {
     async fn count_users_and_prekeys(&self) -> Result<(i64, i64), Status> {
-        let conn = self
-            .db
-            .lock()
-            .map_err(|_| Status::internal("database lock poisoned"))?;
-        let user_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+        let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&self.db)
+            .await
             .map_err(map_db_error)?;
-        let prekey_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM one_time_prekeys", [], |row| {
-                row.get(0)
-            })
+        let prekey_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM one_time_prekeys")
+            .fetch_one(&self.db)
+            .await
             .map_err(map_db_error)?;
         let counts = (user_count, prekey_count);
         Ok(counts)
     }
 
     async fn count_one_time_keys(&self) -> Result<(i64, i64), Status> {
-        let conn = self
-            .db
-            .lock()
-            .map_err(|_| Status::internal("database lock poisoned"))?;
-        let prekey_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM one_time_prekeys", [], |row| {
-                row.get(0)
-            })
+        let prekey_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM one_time_prekeys")
+            .fetch_one(&self.db)
+            .await
             .map_err(map_db_error)?;
-        let kem_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM one_time_kem_keys", [], |row| {
-                row.get(0)
-            })
+        let kem_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM one_time_kem_keys")
+            .fetch_one(&self.db)
+            .await
             .map_err(map_db_error)?;
         let counts = (prekey_count, kem_count);
         Ok(counts)
@@ -827,9 +850,15 @@ mod tests;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:10000".parse()?;
-    let db = Connection::open("server_newspeak.db")?;
-    init_db(&db)?;
-    let db = Arc::new(StdMutex::new(db));
+    let db_options = SqliteConnectOptions::new()
+        .filename("server_newspeak.db")
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let db = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect_with(db_options)
+        .await?;
+    init_db(&db).await?;
     let svc = NewspeakService {
         users: Arc::new(DashMap::new()),
         server_store: ServerStore::new(db),

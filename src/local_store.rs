@@ -1,10 +1,10 @@
 use anyhow::{Result, anyhow};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::Signer;
 use ml_kem::{Encoded, EncodedSizeUser, MlKem1024Params, kem::DecapsulationKey};
-use rusqlite::{Connection, Error as RusqliteError, OptionalExtension, params};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::{Row, SqlitePool};
 use x25519_dalek as x25519;
 
 use crate::pqxdh;
@@ -21,7 +21,7 @@ pub struct ConversationMessage {
 
 #[derive(Clone)]
 pub struct LocalStorage {
-    db: Arc<Mutex<Connection>>,
+    db: SqlitePool,
 }
 
 struct StoredUser {
@@ -39,12 +39,17 @@ impl LocalStorage {
 
     pub async fn new_with_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let db = Connection::open(path)?;
-        Self::init_migrations(&db)?;
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        Self::init_migrations(&db).await?;
 
-        Ok(LocalStorage {
-            db: Arc::new(Mutex::new(db)),
-        })
+        Ok(LocalStorage { db })
     }
 
     pub async fn load_or_create_user(&self, username: &str) -> Result<pqxdh::KeyExchangeUser> {
@@ -64,29 +69,21 @@ impl LocalStorage {
 
     async fn load_user(&self, username: &str) -> Result<Option<StoredUser>> {
         let username_owned = username.to_string();
-        let row = {
-            let conn = self
-                .db
-                .lock()
-                .map_err(|_| anyhow!("database lock poisoned"))?;
-            conn.query_row(
-                "SELECT identity_sk, signed_prekey_sk, kem_decap
-                 FROM local_users
-                 WHERE username = ?1",
-                params![username_owned],
-                |row| {
-                    let identity_sk: Vec<u8> = row.get(0)?;
-                    let signed_prekey_sk: Vec<u8> = row.get(1)?;
-                    let kem_decap: Vec<u8> = row.get(2)?;
-                    Ok((identity_sk, signed_prekey_sk, kem_decap))
-                },
-            )
-            .optional()?
-        };
+        let row = sqlx::query(
+            "SELECT identity_sk, signed_prekey_sk, kem_decap
+             FROM local_users
+             WHERE username = ?1",
+        )
+        .bind(&username_owned)
+        .fetch_optional(&self.db)
+        .await?;
 
-        let Some((identity_sk, signed_prekey_sk, kem_decap)) = row else {
+        let Some(row) = row else {
             return Ok(None);
         };
+        let identity_sk: Vec<u8> = row.get(0);
+        let signed_prekey_sk: Vec<u8> = row.get(1);
+        let kem_decap: Vec<u8> = row.get(2);
 
         let kem_store = self.get_user_kem_keys(username).await?;
         let ec_store = self.get_user_ec_keys(username).await?;
@@ -102,27 +99,19 @@ impl LocalStorage {
 
     async fn load_identity_sk(&self, username: &str) -> Result<Option<[u8; 32]>> {
         let username = username.to_string();
-        let row = {
-            let conn = self
-                .db
-                .lock()
-                .map_err(|_| anyhow!("database lock poisoned"))?;
-            conn.query_row(
-                "SELECT identity_sk
-                 FROM local_users
-                 WHERE username = ?1",
-                params![username],
-                |row| {
-                    let identity_sk: Vec<u8> = row.get(0)?;
-                    Ok(identity_sk)
-                },
-            )
-            .optional()?
-        };
+        let row = sqlx::query(
+            "SELECT identity_sk
+             FROM local_users
+             WHERE username = ?1",
+        )
+        .bind(&username)
+        .fetch_optional(&self.db)
+        .await?;
 
-        let Some(identity_sk) = row else {
+        let Some(row) = row else {
             return Ok(None);
         };
+        let identity_sk: Vec<u8> = row.get(0);
 
         Ok(Some(bytes_to_32(&identity_sk)?))
     }
@@ -139,21 +128,22 @@ impl LocalStorage {
         let username_owned = username.to_string();
 
         {
-            let mut conn = self
-                .db
-                .lock()
-                .map_err(|_| anyhow!("database lock poisoned"))?;
-            let tx = conn.transaction()?;
-            tx.execute(
+            let mut tx = self.db.begin().await?;
+            sqlx::query(
                 "INSERT INTO local_users (
                     username,
                     identity_sk,
                     signed_prekey_sk,
                     kem_decap
                 ) VALUES (?1, ?2, ?3, ?4)",
-                params![username_owned, identity_sk, signed_prekey_sk, kem_decap],
-            )?;
-            tx.commit()?;
+            )
+            .bind(&username_owned)
+            .bind(&identity_sk)
+            .bind(&signed_prekey_sk)
+            .bind(&kem_decap)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
         }
 
         self.insert_kem_keys(&username, &user.one_time_kem_keys)
@@ -184,25 +174,24 @@ impl LocalStorage {
         let username = username.to_string();
 
         {
-            let mut conn = self
-                .db
-                .lock()
-                .map_err(|_| anyhow!("database lock poisoned"))?;
-            let tx = conn.transaction()?;
-            {
-                let mut stmt = tx.prepare(
+            let mut tx = self.db.begin().await?;
+            for (id, key_bytes, used) in rows {
+                sqlx::query(
                     "INSERT INTO kem_keys (
                         id,
                         username,
                         decap,
                         used
                     ) VALUES (?1, ?2, ?3, ?4)",
-                )?;
-                for (id, key_bytes, used) in rows {
-                    stmt.execute(params![id, &username, key_bytes, used])?;
-                }
+                )
+                .bind(id.to_vec())
+                .bind(&username)
+                .bind(&key_bytes)
+                .bind(used)
+                .execute(&mut *tx)
+                .await?;
             }
-            tx.commit()?;
+            tx.commit().await?;
         }
 
         Ok(())
@@ -229,25 +218,24 @@ impl LocalStorage {
         let username = username.to_string();
 
         {
-            let mut conn = self
-                .db
-                .lock()
-                .map_err(|_| anyhow!("database lock poisoned"))?;
-            let tx = conn.transaction()?;
-            {
-                let mut stmt = tx.prepare(
+            let mut tx = self.db.begin().await?;
+            for (id, key_bytes, used) in rows {
+                sqlx::query(
                     "INSERT INTO ec_keys (
                         id,
                         username,
                         sk,
                         used
                     ) VALUES (?1, ?2, ?3, ?4)",
-                )?;
-                for (id, key_bytes, used) in rows {
-                    stmt.execute(params![id, &username, key_bytes, used])?;
-                }
+                )
+                .bind(id as i64)
+                .bind(&username)
+                .bind(&key_bytes)
+                .bind(used)
+                .execute(&mut *tx)
+                .await?;
             }
-            tx.commit()?;
+            tx.commit().await?;
         }
 
         Ok(())
@@ -263,30 +251,19 @@ impl LocalStorage {
         };
         let identity_sk = ed25519_dalek::SigningKey::from_bytes(&identity_sk_bytes);
         let username = username.to_string();
-        let rows = {
-            let conn = self
-                .db
-                .lock()
-                .map_err(|_| anyhow!("database lock poisoned"))?;
-            let mut stmt = conn.prepare(
-                "SELECT id, decap, used
-                FROM kem_keys
-                WHERE username = ?1",
-            )?;
-            let rows = stmt.query_map(params![username], |row| {
-                let id: Vec<u8> = row.get(0)?;
-                let decap: Vec<u8> = row.get(1)?;
-                let used: i64 = row.get(2)?;
-                Ok((id, decap, used))
-            })?;
-            let mut results = Vec::new();
-            for row in rows {
-                results.push(row?);
-            }
-            results
-        };
+        let rows = sqlx::query(
+            "SELECT id, decap, used
+            FROM kem_keys
+            WHERE username = ?1",
+        )
+        .bind(&username)
+        .fetch_all(&self.db)
+        .await?;
 
-        for (id_bytes, decap, used) in rows {
+        for row in rows {
+            let id_bytes: Vec<u8> = row.get(0);
+            let decap: Vec<u8> = row.get(1);
+            let used: i64 = row.get(2);
             let id = bytes_to_16(&id_bytes)?;
             let encoded = Encoded::<DecapsulationKey<MlKem1024Params>>::try_from(decap.as_slice())
                 .map_err(|_| anyhow!("invalid kem decapsulation key length: {}", decap.len()))?;
@@ -317,30 +294,19 @@ impl LocalStorage {
         };
         let identity_sk = ed25519_dalek::SigningKey::from_bytes(&identity_sk_bytes);
         let username = username.to_string();
-        let rows = {
-            let conn = self
-                .db
-                .lock()
-                .map_err(|_| anyhow!("database lock poisoned"))?;
-            let mut stmt = conn.prepare(
-                "SELECT id, sk, used
-                FROM ec_keys
-                WHERE username = ?1",
-            )?;
-            let rows = stmt.query_map(params![username], |row| {
-                let id: i64 = row.get(0)?;
-                let sk: Vec<u8> = row.get(1)?;
-                let used: i64 = row.get(2)?;
-                Ok((id, sk, used))
-            })?;
-            let mut results = Vec::new();
-            for row in rows {
-                results.push(row?);
-            }
-            results
-        };
+        let rows = sqlx::query(
+            "SELECT id, sk, used
+            FROM ec_keys
+            WHERE username = ?1",
+        )
+        .bind(&username)
+        .fetch_all(&self.db)
+        .await?;
 
-        for (id, sk, used) in rows {
+        for row in rows {
+            let id: i64 = row.get(0);
+            let sk: Vec<u8> = row.get(1);
+            let used: i64 = row.get(2);
             let id: u32 = id
                 .try_into()
                 .map_err(|_| anyhow!("invalid ec key id: {}", id))?;
@@ -369,27 +335,20 @@ impl LocalStorage {
     ) -> Result<Option<RatchetState>> {
         let username = username.to_string();
         let peer = peer.to_string();
-        let row = {
-            let conn = self
-                .db
-                .lock()
-                .map_err(|_| anyhow!("database lock poisoned"))?;
-            conn.query_row(
-                "SELECT ratchet_state
-                 FROM conversations
-                 WHERE username = ?1 AND peer = ?2",
-                params![username, peer],
-                |row| {
-                    let ratchet_state: Vec<u8> = row.get(0)?;
-                    Ok(ratchet_state)
-                },
-            )
-            .optional()?
-        };
+        let row = sqlx::query(
+            "SELECT ratchet_state
+             FROM conversations
+             WHERE username = ?1 AND peer = ?2",
+        )
+        .bind(&username)
+        .bind(&peer)
+        .fetch_optional(&self.db)
+        .await?;
 
-        let Some(ratchet_state) = row else {
+        let Some(row) = row else {
             return Ok(None);
         };
+        let ratchet_state: Vec<u8> = row.get(0);
 
         Ok(Some(ratchet_state_from_bytes(&ratchet_state)?))
     }
@@ -405,12 +364,8 @@ impl LocalStorage {
         let peer = peer.to_string();
 
         {
-            let mut conn = self
-                .db
-                .lock()
-                .map_err(|_| anyhow!("database lock poisoned"))?;
-            let tx = conn.transaction()?;
-            tx.execute(
+            let mut tx = self.db.begin().await?;
+            sqlx::query(
                 "INSERT INTO conversations (
                     username,
                     peer,
@@ -418,9 +373,13 @@ impl LocalStorage {
                 ) VALUES (?1, ?2, ?3)
                 ON CONFLICT(username, peer)
                 DO UPDATE SET ratchet_state = excluded.ratchet_state",
-                params![username, peer, ratchet_state],
-            )?;
-            tx.commit()?;
+            )
+            .bind(&username)
+            .bind(&peer)
+            .bind(&ratchet_state)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
         }
 
         Ok(())
@@ -441,20 +400,20 @@ impl LocalStorage {
         let is_sender = if is_sender { 1 } else { 0 };
 
         {
-            let mut conn = self
-                .db
-                .lock()
-                .map_err(|_| anyhow!("database lock poisoned"))?;
-            let tx = conn.transaction()?;
-            tx.execute(
+            let mut tx = self.db.begin().await?;
+            sqlx::query(
                 "INSERT INTO messages (
                     conversation_id,
                     content,
                     is_sender
                 ) VALUES (?1, ?2, ?3)",
-                params![conversation_id, content, is_sender],
-            )?;
-            tx.commit()?;
+            )
+            .bind(conversation_id)
+            .bind(&content)
+            .bind(is_sender)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
         }
 
         Ok(())
@@ -468,34 +427,25 @@ impl LocalStorage {
         let Some(conversation_id) = self.get_conversation_id(username, peer).await? else {
             return Ok(Vec::new());
         };
-        let rows = {
-            let conn = self
-                .db
-                .lock()
-                .map_err(|_| anyhow!("database lock poisoned"))?;
-            let mut stmt = conn.prepare(
-                "SELECT content, is_sender
-                 FROM messages
-                 WHERE conversation_id = ?1
-                 ORDER BY id ASC",
-            )?;
-            let rows = stmt.query_map(params![conversation_id], |row| {
-                let content: String = row.get(0)?;
-                let is_sender: i64 = row.get(1)?;
-                Ok((content, is_sender))
-            })?;
-            let mut results = Vec::new();
-            for row in rows {
-                results.push(row?);
-            }
-            results
-        };
+        let rows = sqlx::query(
+            "SELECT content, is_sender
+             FROM messages
+             WHERE conversation_id = ?1
+             ORDER BY id ASC",
+        )
+        .bind(conversation_id)
+        .fetch_all(&self.db)
+        .await?;
 
         let messages = rows
             .into_iter()
-            .map(|(content, is_sender)| ConversationMessage {
-                content,
-                is_sender: is_sender != 0,
+            .map(|row| {
+                let content: String = row.get(0);
+                let is_sender: i64 = row.get(1);
+                ConversationMessage {
+                    content,
+                    is_sender: is_sender != 0,
+                }
             })
             .collect();
 
@@ -505,51 +455,34 @@ impl LocalStorage {
     async fn get_conversation_id(&self, username: &str, peer: &str) -> Result<Option<i64>> {
         let username = username.to_string();
         let peer = peer.to_string();
-        let row = {
-            let conn = self
-                .db
-                .lock()
-                .map_err(|_| anyhow!("database lock poisoned"))?;
-            conn.query_row(
-                "SELECT id
-                 FROM conversations
-                 WHERE username = ?1 AND peer = ?2",
-                params![username, peer],
-                |row| row.get(0),
-            )
-            .optional()?
-        };
+        let row = sqlx::query(
+            "SELECT id
+             FROM conversations
+             WHERE username = ?1 AND peer = ?2",
+        )
+        .bind(&username)
+        .bind(&peer)
+        .fetch_optional(&self.db)
+        .await?;
 
-        Ok(row)
+        Ok(row.map(|row| row.get(0)))
     }
 
     pub async fn get_user_conversations(&self, username: &str) -> Result<Vec<String>> {
         let username = username.to_string();
-        let rows = {
-            let conn = self
-                .db
-                .lock()
-                .map_err(|_| anyhow!("database lock poisoned"))?;
-            let mut stmt = conn.prepare(
-                "SELECT peer
-                 FROM conversations
-                 WHERE username = ?1",
-            )?;
-            let rows = stmt.query_map(params![username], |row| {
-                let peer: String = row.get(0)?;
-                Ok(peer)
-            })?;
-            let mut results = Vec::new();
-            for row in rows {
-                results.push(row?);
-            }
-            results
-        };
+        let rows = sqlx::query(
+            "SELECT peer
+             FROM conversations
+             WHERE username = ?1",
+        )
+        .bind(&username)
+        .fetch_all(&self.db)
+        .await?;
 
-        Ok(rows)
+        Ok(rows.into_iter().map(|row| row.get(0)).collect())
     }
 
-    fn init_migrations(conn: &Connection) -> Result<(), RusqliteError> {
+    async fn init_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         // some thoughts on the schema: for a relational format it makes more sense to store the
         // user like this, overall sqlite is very reliable and a good also for internal storage in
         // my opinion.
@@ -562,44 +495,54 @@ impl LocalStorage {
         // TODO: might be easier to store all content as bytes blos and deserialize on load,
         //       but that would make queries harder if we want to do anything more complex later on
 
-        conn.execute_batch(
-            "PRAGMA foreign_keys = ON;
-            CREATE TABLE IF NOT EXISTS local_users (
+        sqlx::query("PRAGMA foreign_keys = ON;")
+            .execute(pool)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS local_users (
                 username TEXT NOT NULL PRIMARY KEY,
                 identity_sk BLOB NOT NULL,
                 signed_prekey_sk BLOB NOT NULL,
                 kem_decap BLOB NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS kem_keys(
+            );",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS kem_keys(
                 id BLOB PRIMARY KEY,
                 username TEXT NOT NULL,
                 decap BLOB NOT NULL,
                 used INTEGER NOT NULL,
                 FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS ec_keys(
+            );",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS ec_keys(
                 id INTEGER PRIMARY KEY,
                 username TEXT NOT NULL,
                 sk BLOB NOT NULL,
                 used INTEGER NOT NULL,
                 FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
             );",
-        )?;
-
-        conn.execute_batch(
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS conversations(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT NOT NULL,
-                    peer TEXT NOT NULL,
-                    ratchet_state BLOB NOT NULL,
-                    UNIQUE (username, peer),
-                    FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
-                );",
-        )?;
-
-        conn.execute_batch(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                peer TEXT NOT NULL,
+                ratchet_state BLOB NOT NULL,
+                UNIQUE (username, peer),
+                FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
+            );",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS messages(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 conversation_id INTEGER NOT NULL,
@@ -607,7 +550,9 @@ impl LocalStorage {
                 is_sender INTEGER NOT NULL,
                 FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
             );",
-        )?;
+        )
+        .execute(pool)
+        .await?;
 
         Ok(())
     }
