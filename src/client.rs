@@ -20,12 +20,13 @@ use crate::{
     ratchet::{RatchetMessage, RatchetState},
 };
 use anyhow::{Result, anyhow};
+use chrono::{DateTime, Local};
 use ed25519_dalek::{self as ed25519, Signer};
 use ml_kem::{Encoded, EncodedSizeUser, MlKem1024Params, kem::EncapsulationKey};
 use prost_types::Timestamp;
 use std::io::Write;
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -351,11 +352,23 @@ fn now_unix_seconds() -> i64 {
 }
 
 fn timestamp_seconds(timestamp: Option<&Timestamp>) -> i64 {
-    timestamp.map(|t| t.seconds).unwrap_or_else(now_unix_seconds)
+    timestamp
+        .map(|t| t.seconds)
+        .unwrap_or_else(now_unix_seconds)
+}
+
+fn format_timestamp(timestamp: i64) -> String {
+    if timestamp <= 0 {
+        return "unknown time".to_string();
+    }
+
+    let system_time = UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64);
+    let datetime: DateTime<Local> = system_time.into();
+    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn format_chat_line(timestamp: i64, sender: &str, content: &str) -> String {
-    format!("{} {}: {}", timestamp, sender, content)
+    format!("[{}] {}: {}", format_timestamp(timestamp), sender, content)
 }
 
 fn is_newer_timestamp(candidate: &Timestamp, current: &Timestamp) -> bool {
@@ -559,7 +572,8 @@ async fn main() -> Result<()> {
     .await?;
 
     let stored_conversation = storage.get_conversation(&args[1], &receiver).await?;
-    if stored_conversation.is_some() {
+    let found_conversation = stored_conversation.is_some();
+    if found_conversation {
         println!("loaded conversation state for {}", receiver);
         let history = storage
             .get_conversation_messages(&args[1], &receiver)
@@ -576,12 +590,14 @@ async fn main() -> Result<()> {
             );
         }
     }
+
     let ratchet_state = Arc::new(Mutex::new(stored_conversation));
     let key_info = Arc::clone(&user.key_info);
     let ratchet_state_inbound = Arc::clone(&ratchet_state);
     let storage_inbound = storage.clone();
     let username_inbound = args[1].clone();
     let tx_inbound = tx.clone();
+
     tokio::spawn(async move {
         while let Some(message) = inbound.message().await.transpose() {
             match message {
@@ -596,9 +612,10 @@ async fn main() -> Result<()> {
                                     continue;
                                 };
                                 if let Some(timestamp) = offline.timestamp {
-                                    let update = latest_timestamp
-                                        .as_ref()
-                                        .map_or(true, |current| is_newer_timestamp(&timestamp, current));
+                                    let update =
+                                        latest_timestamp.as_ref().map_or(true, |current| {
+                                            is_newer_timestamp(&timestamp, current)
+                                        });
                                     if update {
                                         latest_timestamp = Some(timestamp.clone());
                                     }
@@ -633,11 +650,13 @@ async fn main() -> Result<()> {
                             }
                             if let Some(latest) = latest_timestamp {
                                 let ack = ClientMessage {
-                                    message_type: Some(client_message::MessageType::AckOfflineMessages(
-                                        AckOfflineMessages {
-                                            latest_timestamp: Some(latest),
-                                        },
-                                    )),
+                                    message_type: Some(
+                                        client_message::MessageType::AckOfflineMessages(
+                                            AckOfflineMessages {
+                                                latest_timestamp: Some(latest),
+                                            },
+                                        ),
+                                    ),
                                 };
                                 if let Err(err) = tx_inbound.send(ack).await {
                                     eprintln!("failed to ack offline messages: {}", err);
@@ -676,6 +695,29 @@ async fn main() -> Result<()> {
         }
     });
 
+    if !found_conversation {
+        let (key_message, r_state) = user.create_key_exchange_message(args[2].clone()).await?;
+        let mut guard = ratchet_state.lock().await;
+        *guard = Some(r_state);
+        if let Some(state) = guard.as_ref() {
+            storage
+                .update_conversation(&args[1], &receiver, state)
+                .await?;
+        }
+
+        tx.send(ClientMessage {
+            message_type: Some(client_message::MessageType::KeyExchangeMessage(key_message)),
+        })
+        .await?;
+
+        let timestamp = now_unix_seconds();
+        print_incoming(&format_chat_line(
+            timestamp,
+            "system",
+            &format!("key exchange initiated with {}", receiver),
+        ));
+    }
+
     print_prompt();
     while let Some(line) = lines.next_line().await? {
         if line == "exit" {
@@ -684,32 +726,6 @@ async fn main() -> Result<()> {
 
         if line == "" {
             print_prompt();
-            continue;
-        }
-
-        // TODO: this should automatically be done, however currently there is no way of storing
-        // messages and therefore both clients need to connect before writing this message.
-        if line == "/init" {
-            let (key_message, r_state) = user.create_key_exchange_message(args[2].clone()).await?;
-            let mut guard = ratchet_state.lock().await;
-            *guard = Some(r_state);
-            if let Some(state) = guard.as_ref() {
-                storage
-                    .update_conversation(&args[1], &receiver, state)
-                    .await?;
-            }
-
-            tx.send(ClientMessage {
-                message_type: Some(client_message::MessageType::KeyExchangeMessage(key_message)),
-            })
-            .await?;
-
-            let timestamp = now_unix_seconds();
-            print_incoming(&format_chat_line(
-                timestamp,
-                "system",
-                &format!("key exchange initiated with {}", receiver),
-            ));
             continue;
         }
 
@@ -735,8 +751,9 @@ async fn main() -> Result<()> {
                 ratchet_message: Some(ratchet_message_to_proto(msg)),
                 timestamp: Some(message_timestamp.clone()),
             };
-            if let Err(err) =
-                storage.add_message(&args[1], &receiver, &line, true, timestamp).await
+            if let Err(err) = storage
+                .add_message(&args[1], &receiver, &line, true, timestamp)
+                .await
             {
                 eprintln!("failed to store message: {}", err);
             }
