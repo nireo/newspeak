@@ -291,15 +291,22 @@ fn parse_ml_kem_signed_prekey(prekey: &newspeak::SignedPrekey) -> Result<PublicS
     })
 }
 
-fn print_prompt() {
-    print!(">>> ");
+fn clear_terminal() {
+    print!("\x1b[2J\x1b[H");
     let _ = std::io::stdout().flush();
 }
 
 fn print_incoming(message: &str) {
     print!("\r\x1b[2K");
     println!("{}", message);
-    print_prompt();
+    let _ = std::io::stdout().flush();
+}
+
+fn print_outgoing(message: &str) {
+    // Replace the echoed input line with the formatted message.
+    print!("\x1b[1A\r\x1b[2K");
+    println!("{}", message);
+    let _ = std::io::stdout().flush();
 }
 
 fn ratchet_message_to_proto(message: RatchetMessage) -> ProtoRatchetMessage {
@@ -571,6 +578,7 @@ async fn main() -> Result<()> {
     })
     .await?;
 
+    clear_terminal();
     let stored_conversation = storage.get_conversation(&args[1], &receiver).await?;
     let found_conversation = stored_conversation.is_some();
     if found_conversation {
@@ -718,14 +726,12 @@ async fn main() -> Result<()> {
         ));
     }
 
-    print_prompt();
     while let Some(line) = lines.next_line().await? {
         if line == "exit" {
             break;
         }
 
         if line == "" {
-            print_prompt();
             continue;
         }
 
@@ -765,7 +771,7 @@ async fn main() -> Result<()> {
                 message_type: Some(client_message::MessageType::EncryptedMessage(rpc_message)),
             })
             .await?;
-            print_incoming(&format_chat_line(timestamp, &args[1], &line));
+            print_outgoing(&format_chat_line(timestamp, &args[1], &line));
         } else {
             print_incoming(&format_chat_line(
                 timestamp,
