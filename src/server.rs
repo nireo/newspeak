@@ -20,7 +20,8 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::time::{self, Duration, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
-use tonic::{Code, Request, Response, Status, Streaming};
+use tonic::{Code, GrpcMethod, Request, Response, Status, Streaming};
+use tracing::{debug, info};
 
 use crate::newspeak::{
     AddSignedPrekeysRequest, AddSignedPrekeysResponse, ClientMessage, JoinResponse, ServerMessage,
@@ -38,6 +39,27 @@ const AUTH_CHALLENGE_TTL: Duration = Duration::from_secs(300);
 enum OfflineMessageKind {
     KeyExchange = 1,
     Regular = 2,
+}
+
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+fn log_interceptor(req: Request<()>) -> Result<Request<()>, Status> {
+    let peer_addr = req.remote_addr();
+    if let Some(method) = req.extensions().get::<GrpcMethod<'static>>() {
+        info!(
+            service = method.service(),
+            method = method.method(),
+            peer_addr = ?peer_addr,
+            "grpc request"
+        );
+    } else {
+        info!(peer_addr = ?peer_addr, "grpc request");
+    }
+    Ok(req)
 }
 
 #[derive(Clone)]
@@ -211,10 +233,12 @@ impl NewspeakService {
                 if message.timestamp.is_none() {
                     message.timestamp = Some(timestamp.clone());
                 }
-                println!(
-                    "message: {}",
-                    hex::encode(&message.ratchet_message.as_ref().unwrap().ciphertext)
-                );
+                if let Some(ratchet) = message.ratchet_message.as_ref() {
+                    debug!(
+                        ciphertext_len = ratchet.ciphertext.len(),
+                        "received encrypted message"
+                    );
+                }
                 let server_message = ServerMessage {
                     message_type: Some(server_message::MessageType::Encrypted(message.clone())),
                 };
@@ -687,7 +711,7 @@ impl Newspeak for NewspeakService {
             return Err(Status::invalid_argument("username is required"));
         }
 
-        println!("fetches prekey bundle for: {}", request.username);
+        info!(username = %request.username, "fetches prekey bundle");
         let bundle = self
             .server_store
             .fetch_prekey_bundle(request.username)
@@ -1069,6 +1093,7 @@ mod tests;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let addr = "[::1]:10000".parse()?;
     let db_options = SqliteConnectOptions::new()
         .filename("server_newspeak.db")
@@ -1085,10 +1110,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth_challenges: Arc::new(AsyncMutex::new(HashMap::new())),
     };
 
-    println!("NewspeakServer listening on {}", addr);
+    info!(address = %addr, "NewspeakServer listening");
 
     Server::builder()
-        .add_service(NewspeakServer::new(svc))
+        .add_service(NewspeakServer::with_interceptor(svc, log_interceptor))
         .serve(addr)
         .await?;
 
