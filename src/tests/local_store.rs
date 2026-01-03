@@ -216,17 +216,21 @@ async fn conversation_messages_roundtrip() -> Result<()> {
     alice.as_initiator(shared_key, bob.sending_pk);
     storage.update_conversation("alice", "bob", &alice).await?;
 
-    storage.add_message("alice", "bob", "hi bob", true).await?;
     storage
-        .add_message("alice", "bob", "hi alice", false)
+        .add_message("alice", "bob", "hi bob", true, 100)
+        .await?;
+    storage
+        .add_message("alice", "bob", "hi alice", false, 200)
         .await?;
 
     let messages = storage.get_conversation_messages("alice", "bob").await?;
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].content, "hi bob");
     assert!(messages[0].is_sender);
+    assert_eq!(messages[0].timestamp, 100);
     assert_eq!(messages[1].content, "hi alice");
     assert!(!messages[1].is_sender);
+    assert_eq!(messages[1].timestamp, 200);
 
     Ok(())
 }

@@ -17,6 +17,7 @@ use crate::ratchet::RatchetState;
 pub struct ConversationMessage {
     pub content: String,
     pub is_sender: bool,
+    pub timestamp: i64,
 }
 
 #[derive(Clone)]
@@ -391,6 +392,7 @@ impl LocalStorage {
         peer: &str,
         content: &str,
         is_sender: bool,
+        timestamp: i64,
     ) -> Result<()> {
         let conversation_id = self
             .get_conversation_id(username, peer)
@@ -405,12 +407,14 @@ impl LocalStorage {
                 "INSERT INTO messages (
                     conversation_id,
                     content,
-                    is_sender
-                ) VALUES (?1, ?2, ?3)",
+                    is_sender,
+                    timestamp
+                ) VALUES (?1, ?2, ?3, ?4)",
             )
             .bind(conversation_id)
             .bind(&content)
             .bind(is_sender)
+            .bind(timestamp)
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
@@ -428,7 +432,7 @@ impl LocalStorage {
             return Ok(Vec::new());
         };
         let rows = sqlx::query(
-            "SELECT content, is_sender
+            "SELECT content, is_sender, timestamp
              FROM messages
              WHERE conversation_id = ?1
              ORDER BY id ASC",
@@ -442,9 +446,11 @@ impl LocalStorage {
             .map(|row| {
                 let content: String = row.get(0);
                 let is_sender: i64 = row.get(1);
+                let timestamp: i64 = row.get(2);
                 ConversationMessage {
                     content,
                     is_sender: is_sender != 0,
+                    timestamp,
                 }
             })
             .collect();
@@ -548,6 +554,7 @@ impl LocalStorage {
                 conversation_id INTEGER NOT NULL,
                 content TEXT NOT NULL,
                 is_sender INTEGER NOT NULL,
+                timestamp INTEGER NOT NULL,
                 FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
             );",
         )

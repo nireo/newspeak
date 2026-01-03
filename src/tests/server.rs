@@ -288,6 +288,7 @@ async fn offline_messages_are_scoped_to_receiver() {
             b"hello",
             "alice",
             "bob",
+            1,
         )
         .await
         .unwrap();
@@ -297,6 +298,7 @@ async fn offline_messages_are_scoped_to_receiver() {
             b"key-exchange",
             "carol",
             "bob",
+            2,
         )
         .await
         .unwrap();
@@ -306,6 +308,7 @@ async fn offline_messages_are_scoped_to_receiver() {
             b"private",
             "alice",
             "dave",
+            3,
         )
         .await
         .unwrap();
@@ -316,14 +319,14 @@ async fn offline_messages_are_scoped_to_receiver() {
         .await
         .unwrap()
         .into_iter()
-        .map(|(_, message)| message)
+        .map(|stored| stored.message)
         .collect();
     bob_messages.sort();
     assert_eq!(bob_messages, vec![b"hello".to_vec(), b"key-exchange".to_vec()]);
 
     let dave_messages = svc.server_store.get_offline_messages("dave").await.unwrap();
     assert_eq!(dave_messages.len(), 1);
-    assert_eq!(dave_messages[0].1, b"private".to_vec());
+    assert_eq!(dave_messages[0].message, b"private".to_vec());
 
     let empty = svc
         .server_store
@@ -343,6 +346,7 @@ async fn delete_offline_messages_respects_timestamp() {
             b"old",
             "alice",
             "bob",
+            1,
         )
         .await
         .unwrap();
@@ -352,6 +356,7 @@ async fn delete_offline_messages_respects_timestamp() {
             b"new",
             "alice",
             "bob",
+            2,
         )
         .await
         .unwrap();
@@ -361,11 +366,11 @@ async fn delete_offline_messages_respects_timestamp() {
 
     let mut old_id = None;
     let mut new_id = None;
-    for (id, message) in rows {
-        if message == b"old" {
-            old_id = Some(id);
-        } else if message == b"new" {
-            new_id = Some(id);
+    for stored in rows {
+        if stored.message == b"old" {
+            old_id = Some(stored.id);
+        } else if stored.message == b"new" {
+            new_id = Some(stored.id);
         }
     }
     assert!(old_id.is_some());
@@ -389,14 +394,17 @@ async fn delete_offline_messages_respects_timestamp() {
         .await
         .unwrap();
 
-    svc.server_store.delete_offline_message(now).await.unwrap();
+    svc.server_store
+        .delete_offline_message("bob", now)
+        .await
+        .unwrap();
 
     let remaining = svc.server_store.get_offline_messages("bob").await.unwrap();
     assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].1, b"new".to_vec());
+    assert_eq!(remaining[0].message, b"new".to_vec());
 
     svc.server_store
-        .delete_offline_message(i64::MAX)
+        .delete_offline_message("bob", i64::MAX)
         .await
         .unwrap();
     let remaining = svc.server_store.get_offline_messages("bob").await.unwrap();

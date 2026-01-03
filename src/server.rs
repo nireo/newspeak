@@ -10,6 +10,7 @@ use newspeak::{
     FetchPrekeyBundleRequest, FetchPrekeyBundleResponse, PrekeyBundle, RegisterRequest,
     RegisterResponse, SignedPrekey,
 };
+use prost::Message;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{self, Row, Sqlite, SqlitePool};
 use std::collections::HashMap;
@@ -34,9 +35,6 @@ struct AuthChallenge {
 
 const AUTH_CHALLENGE_TTL: Duration = Duration::from_secs(300);
 
-const MESSAGE_KIND_KEY_EXCHANGE: i32 = 1;
-const MESSAGE_KIND_REGULAR: i32 = 2;
-
 enum OfflineMessageKind {
     KeyExchange = 1,
     Regular = 2,
@@ -54,6 +52,58 @@ struct NewspeakService {
 }
 
 impl NewspeakService {
+    fn now_timestamp() -> Result<(prost_types::Timestamp, i64), Status> {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|e| Status::internal(format!("system time error: {}", e)))?;
+        let timestamp = prost_types::Timestamp {
+            seconds: now.as_secs() as i64,
+            nanos: 0,
+        };
+        Ok((timestamp, now.as_secs() as i64))
+    }
+
+    fn timestamp_from_unix_secs(seconds: i64) -> Result<prost_types::Timestamp, Status> {
+        if seconds < 0 {
+            return Err(Status::invalid_argument("invalid message timestamp"));
+        }
+        Ok(prost_types::Timestamp {
+            seconds,
+            nanos: 0,
+        })
+    }
+
+    fn apply_timestamp_to_client_message(
+        message: &mut ClientMessage,
+        timestamp: &prost_types::Timestamp,
+    ) {
+        match message.message_type.as_mut() {
+            Some(client_message::MessageType::KeyExchangeMessage(inner)) => {
+                if inner.timestamp.is_none() {
+                    inner.timestamp = Some(timestamp.clone());
+                }
+            }
+            Some(client_message::MessageType::EncryptedMessage(inner)) => {
+                if inner.timestamp.is_none() {
+                    inner.timestamp = Some(timestamp.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn client_message_kind(message: &ClientMessage) -> Option<OfflineMessageKind> {
+        match message.message_type {
+            Some(client_message::MessageType::KeyExchangeMessage(_)) => {
+                Some(OfflineMessageKind::KeyExchange)
+            }
+            Some(client_message::MessageType::EncryptedMessage(_)) => {
+                Some(OfflineMessageKind::Regular)
+            }
+            _ => None,
+        }
+    }
+
     async fn purge_expired_auth_challenges(&self) {
         let challenges = Arc::clone(&self.auth_challenges);
         let mut guard = challenges.lock().await;
@@ -139,28 +189,58 @@ impl NewspeakService {
             }
             Some(client_message::MessageType::KeyExchangeMessage(message)) => {
                 let target = message.receiver_id.clone();
+                let mut message = message;
+                let (timestamp, created_at) = Self::now_timestamp()?;
+                if message.timestamp.is_none() {
+                    message.timestamp = Some(timestamp.clone());
+                }
                 let server_message = ServerMessage {
-                    message_type: Some(server_message::MessageType::KeyExchange(message)),
+                    message_type: Some(server_message::MessageType::KeyExchange(message.clone())),
                 };
-                self.forward_message(target, server_message, tx, users)
-                    .await;
+                let client_message = ClientMessage {
+                    message_type: Some(client_message::MessageType::KeyExchangeMessage(message)),
+                };
+                self.forward_message(target, server_message, client_message, created_at, users)
+                    .await?;
                 Ok(())
             }
             Some(client_message::MessageType::EncryptedMessage(message)) => {
                 let target = message.receiver_id.clone();
+                let mut message = message;
+                let (timestamp, created_at) = Self::now_timestamp()?;
+                if message.timestamp.is_none() {
+                    message.timestamp = Some(timestamp.clone());
+                }
                 println!(
                     "message: {}",
                     hex::encode(&message.ratchet_message.as_ref().unwrap().ciphertext)
                 );
                 let server_message = ServerMessage {
-                    message_type: Some(server_message::MessageType::Encrypted(message)),
+                    message_type: Some(server_message::MessageType::Encrypted(message.clone())),
                 };
-                self.forward_message(target, server_message, tx, users)
-                    .await;
+                let client_message = ClientMessage {
+                    message_type: Some(client_message::MessageType::EncryptedMessage(message)),
+                };
+                self.forward_message(target, server_message, client_message, created_at, users)
+                    .await?;
                 Ok(())
             }
             Some(client_message::MessageType::AckOfflineMessages(ack)) => {
-                todo!()
+                let Some(username) = active_username.clone() else {
+                    return Err(Status::unauthenticated(
+                        "join the stream before acknowledging offline messages",
+                    ));
+                };
+                let Some(latest) = ack.latest_timestamp else {
+                    return Err(Status::invalid_argument("missing latest timestamp"));
+                };
+                if latest.seconds < 0 {
+                    return Err(Status::invalid_argument("invalid latest timestamp"));
+                }
+                self.server_store
+                    .delete_offline_message(&username, latest.seconds)
+                    .await?;
+                Ok(())
             }
             None => Err(Status::invalid_argument("missing message type")),
         }
@@ -190,14 +270,32 @@ impl NewspeakService {
             return Err(Status::already_exists("username already connected"));
         }
         users.insert(join_request.username.clone(), tx.clone());
+
+        let stored_messages = self
+            .server_store
+            .get_offline_messages(&join_request.username)
+            .await?;
+        let mut offline_messages = Vec::new();
+        for stored in stored_messages {
+            let timestamp = Self::timestamp_from_unix_secs(stored.created_at)?;
+            let mut message = ClientMessage::decode(stored.message.as_slice())
+                .map_err(|_| Status::internal("failed to decode offline message"))?;
+            Self::apply_timestamp_to_client_message(&mut message, &timestamp);
+            offline_messages.push(newspeak::OfflineMessage {
+                timestamp: Some(timestamp),
+                message: Some(message),
+            });
+        }
+
         *active_username = Some(join_request.username);
 
+        let (join_timestamp, _) = Self::now_timestamp()?;
         let _ = tx
             .send(Ok(ServerMessage {
                 message_type: Some(server_message::MessageType::JoinResponse(JoinResponse {
                     message: "joined".to_string(),
-                    timestamp: None,
-                    offline_messages: Vec::new(), // TODO: fetch offline messages
+                    timestamp: Some(join_timestamp),
+                    offline_messages,
                 })),
             }))
             .await;
@@ -209,14 +307,40 @@ impl NewspeakService {
         &self,
         target: String,
         server_message: ServerMessage,
-        tx: &mpsc::Sender<Result<ServerMessage, Status>>,
+        client_message: ClientMessage,
+        created_at: i64,
         users: &Arc<DashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>,
-    ) {
+    ) -> Result<(), Status> {
         if let Some(peer_tx) = users.get(&target) {
             let _ = peer_tx.send(Ok(server_message)).await;
-        } else {
-            let _ = tx.send(Ok(server_message)).await;
+            return Ok(());
         }
+
+        let Some(kind) = Self::client_message_kind(&client_message) else {
+            return Err(Status::invalid_argument("unsupported offline message type"));
+        };
+        let encoded = client_message.encode_to_vec();
+        let (sender_username, receiver_username) = match client_message.message_type {
+            Some(client_message::MessageType::KeyExchangeMessage(ref msg)) => {
+                (msg.sender_id.as_str(), msg.receiver_id.as_str())
+            }
+            Some(client_message::MessageType::EncryptedMessage(ref msg)) => {
+                (msg.sender_id.as_str(), msg.receiver_id.as_str())
+            }
+            _ => {
+                return Err(Status::invalid_argument("unsupported offline message payload"));
+            }
+        };
+        self.server_store
+            .insert_message(
+                kind,
+                &encoded,
+                sender_username,
+                receiver_username,
+                created_at,
+            )
+            .await?;
+        Ok(())
     }
 
     async fn remove_active_user(
@@ -234,6 +358,12 @@ impl NewspeakService {
 struct StoredPrekey {
     id: i64,
     prekey: SignedPrekey,
+}
+
+struct StoredOfflineMessage {
+    id: i64,
+    message: Vec<u8>,
+    created_at: i64,
 }
 
 #[derive(Debug)]
@@ -356,13 +486,9 @@ impl ServerStore {
         msg_data: &[u8],
         sender_username: &str,
         receiver_username: &str,
+        created_at: i64,
     ) -> Result<(), Status> {
         let mut tx = self.db.begin().await.map_err(map_db_error)?;
-
-        let timestamp = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|e| Status::internal(format!("system time error: {}", e)))?
-            .as_secs() as i64;
 
         sqlx::query(
             "INSERT INTO offline_messages (
@@ -377,7 +503,7 @@ impl ServerStore {
         .bind(receiver_username)
         .bind(msg_data)
         .bind(msg_kind as i32)
-        .bind(timestamp)
+        .bind(created_at)
         .execute(&mut *tx)
         .await
         .map_err(map_db_error)?;
@@ -390,13 +516,19 @@ impl ServerStore {
     /// delete offline messages received before or at the given timestamp we cannot really delete
     /// the messages after returning them to the client because if the client crashes or fails to
     /// ack them we would lose messages.
-    async fn delete_offline_message(&self, received_timestamp: i64) -> Result<(), Status> {
+    async fn delete_offline_message(
+        &self,
+        receiver_username: &str,
+        received_timestamp: i64,
+    ) -> Result<(), Status> {
         let mut tx = self.db.begin().await.map_err(map_db_error)?;
 
         sqlx::query(
             "DELETE FROM offline_messages
-            WHERE created_at <= ?1",
+            WHERE receiver_username = ?1
+            AND created_at <= ?2",
         )
+        .bind(receiver_username)
         .bind(received_timestamp)
         .execute(&mut *tx)
         .await
@@ -406,13 +538,17 @@ impl ServerStore {
         Ok(())
     }
 
-    async fn get_offline_messages(&self, username: &str) -> Result<Vec<(i32, Vec<u8>)>, Status> {
+    async fn get_offline_messages(
+        &self,
+        username: &str,
+    ) -> Result<Vec<StoredOfflineMessage>, Status> {
         let mut tx = self.db.begin().await.map_err(map_db_error)?;
 
         let rows = sqlx::query(
-            "SELECT id, message
+            "SELECT id, message, created_at
             FROM offline_messages
-            WHERE receiver_username = ?1",
+            WHERE receiver_username = ?1
+            ORDER BY created_at ASC, id ASC",
         )
         .bind(username)
         .fetch_all(&mut *tx)
@@ -421,9 +557,14 @@ impl ServerStore {
 
         let mut messages = Vec::new();
         for row in rows {
-            let id: i32 = row.get(0);
+            let id: i64 = row.get(0);
             let message: Vec<u8> = row.get(1);
-            messages.push((id, message));
+            let created_at: i64 = row.get(2);
+            messages.push(StoredOfflineMessage {
+                id,
+                message,
+                created_at,
+            });
         }
 
         tx.commit().await.map_err(map_db_error)?;
