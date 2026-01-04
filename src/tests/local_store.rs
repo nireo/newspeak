@@ -109,6 +109,43 @@ async fn load_or_create_user_is_stable() -> Result<()> {
 }
 
 #[tokio::test]
+async fn mark_used_persists_in_local_store() -> Result<()> {
+    let db = TempDb::new();
+    let storage = LocalStorage::new_with_path(&db.path).await?;
+    let mut user = pqxdh::KeyExchangeUser::new();
+    user.one_time_keys = pqxdh::KeyStore::new();
+    user.one_time_kem_keys = pqxdh::KeyStore::new();
+    user.one_time_prekey_id = 0;
+    storage.insert_user("alice", &user).await?;
+
+    let mut rng = rand::thread_rng();
+    let mut identity_sk = user.identity_sk.clone();
+    let ec_key = pqxdh::SignedPrekey::new(&mut rng, &mut identity_sk);
+    let kem_key = pqxdh::SignedMlKemPrekey::new(&mut rng, &mut identity_sk);
+    let ec_id = 3u32;
+    let kem_id = pqxdh::kem_id_from_key(kem_key.encap_key.as_bytes().as_slice());
+
+    let mut ec_store = pqxdh::KeyStore::new();
+    ec_store.insert(ec_id, ec_key);
+    storage.insert_ec_keys("alice", &ec_store).await?;
+
+    let mut kem_store = pqxdh::KeyStore::new();
+    kem_store.insert(kem_id, kem_key);
+    storage.insert_kem_keys("alice", &kem_store).await?;
+
+    storage.mark_ec_key_used("alice", ec_id).await?;
+    storage.mark_kem_key_used("alice", &kem_id).await?;
+
+    let ec_keys = storage.get_user_ec_keys("alice").await?;
+    let kem_keys = storage.get_user_kem_keys("alice").await?;
+
+    assert_eq!(ec_keys.is_used(&ec_id), Some(true));
+    assert_eq!(kem_keys.is_used(&kem_id), Some(true));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn insert_user_persists_keys() -> Result<()> {
     let db = TempDb::new();
     let storage = LocalStorage::new_with_path(&db.path).await?;

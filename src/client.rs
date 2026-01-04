@@ -9,9 +9,9 @@ use crate::{
     local_store::LocalStorage,
     newspeak::{
         AckOfflineMessages, AddSignedPrekeysRequest, ClientMessage, EncryptedMessage,
-        FetchPrekeyBundleRequest, InitialMessage, JoinRequest, KeyKind,
-        JoinResponse, RatchetMessage as ProtoRatchetMessage, RegisterRequest, ServerMessage,
-        client_message, newspeak_client::NewspeakClient, server_message,
+        FetchPrekeyBundleRequest, InitialMessage, JoinRequest, JoinResponse, KeyKind,
+        RatchetMessage as ProtoRatchetMessage, RegisterRequest, ServerMessage, client_message,
+        newspeak_client::NewspeakClient, server_message,
     },
     pqxdh::{
         KeyExchangeUser, PQXDHInitMessage, PrekeyBundle, PublicSignedMlKemPrekey,
@@ -417,20 +417,51 @@ async fn handle_key_exchange_message(
         }
     };
 
-    let key_info = key_info.lock().await;
-    let shared_key = match key_info.receive_key_exchange(&init) {
-        Ok(shared_key) => shared_key,
-        Err(err) => {
-            eprintln!("failed to receive key exchange: {}", err);
-            return;
+    let (shared_key, sending_sk, one_time_prekey_used, kem_used, last_resort_id) = {
+        let mut key_info = key_info.lock().await;
+        let shared_key = match key_info.receive_key_exchange(&init) {
+            Ok(shared_key) => shared_key,
+            Err(err) => {
+                eprintln!("failed to receive key exchange: {}", err);
+                return;
+            }
+        };
+        let one_time_prekey_used = init.one_time_prekey_used;
+        if let Some(id) = one_time_prekey_used {
+            key_info.one_time_keys.mark_used(&id);
         }
+        let kem_used = init.kem_used;
+        if kem_used != key_info.last_resort_id {
+            key_info.one_time_kem_keys.mark_used(&kem_used);
+        }
+        (
+            shared_key,
+            key_info.signed_prekey.private_key.clone(),
+            one_time_prekey_used,
+            kem_used,
+            key_info.last_resort_id,
+        )
     };
+
+    // mark the keys separately not to hold the mutex down. it doesn't really matter though since
+    // these are mainly local db operations which are really fast. just as a note. also makes sense
+    // to copy the value out not to hold the guard for way too long.
+    if let Some(id) = one_time_prekey_used {
+        if let Err(err) = storage.mark_ec_key_used(username, id).await {
+            eprintln!("failed to mark one-time prekey used: {}", err);
+        }
+    }
+
+    if kem_used != last_resort_id {
+        if let Err(err) = storage.mark_kem_key_used(username, &kem_used).await {
+            eprintln!("failed to mark one-time kem key used: {}", err);
+        }
+    }
 
     let mut ratchet = RatchetState::new();
     ratchet.as_receiver(shared_key);
-    ratchet.sending_sk = key_info.signed_prekey.private_key.clone();
+    ratchet.sending_sk = sending_sk;
     ratchet.sending_pk = x25519::PublicKey::from(&ratchet.sending_sk);
-    drop(key_info);
 
     let mut guard = ratchet_state.lock().await;
     *guard = Some(ratchet);
@@ -704,13 +735,8 @@ fn spawn_inbound_task(
                         .await;
                     }
                     Some(server_message::MessageType::Encrypted(message)) => {
-                        handle_encrypted_message(
-                            message,
-                            &ratchet_state,
-                            &storage,
-                            &username,
-                        )
-                        .await;
+                        handle_encrypted_message(message, &ratchet_state, &storage, &username)
+                            .await;
                     }
                     None => {
                         eprintln!("server sent an empty message");
@@ -742,11 +768,15 @@ async fn initiate_key_exchange_if_needed(
         return Ok(());
     }
 
-    let (key_message, r_state) = user.create_key_exchange_message(receiver.to_string()).await?;
+    let (key_message, r_state) = user
+        .create_key_exchange_message(receiver.to_string())
+        .await?;
     let mut guard = ratchet_state.lock().await;
     *guard = Some(r_state);
     if let Some(state) = guard.as_ref() {
-        storage.update_conversation(username, receiver, state).await?;
+        storage
+            .update_conversation(username, receiver, state)
+            .await?;
     }
 
     tx.send(ClientMessage {
@@ -859,8 +889,7 @@ async fn main() -> Result<()> {
     send_join_request(&user, &tx).await?;
 
     clear_terminal();
-    let stored_conversation =
-        load_conversation_history(&storage, &username, &receiver).await?;
+    let stored_conversation = load_conversation_history(&storage, &username, &receiver).await?;
     let found_conversation = stored_conversation.is_some();
 
     let ratchet_state = Arc::new(Mutex::new(stored_conversation));

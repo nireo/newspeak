@@ -329,6 +329,38 @@ impl LocalStorage {
         Ok(key_store)
     }
 
+    pub async fn mark_ec_key_used(&self, username: &str, id: u32) -> Result<()> {
+        let username = username.to_string();
+        let mut tx = self.db.begin().await?;
+        sqlx::query(
+            "UPDATE ec_keys
+             SET used = 1
+             WHERE username = ?1 AND id = ?2",
+        )
+        .bind(&username)
+        .bind(i64::from(id))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn mark_kem_key_used(&self, username: &str, id: &KemId) -> Result<()> {
+        let username = username.to_string();
+        let mut tx = self.db.begin().await?;
+        sqlx::query(
+            "UPDATE kem_keys
+             SET used = 1
+             WHERE username = ?1 AND id = ?2",
+        )
+        .bind(&username)
+        .bind(id.to_vec())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn get_conversation(
         &self,
         username: &str,
