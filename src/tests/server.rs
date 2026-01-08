@@ -279,6 +279,43 @@ async fn auth_challenge_expires() {
 }
 
 #[tokio::test]
+async fn auth_challenge_cleanup_runs_in_background() {
+    let svc = test_service().await;
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
+    let request = RegisterRequest {
+        username: "frank".to_string(),
+        identity_key: signing_key.verifying_key().to_bytes().to_vec(),
+        signed_prekey: Some(sample_prekey(KeyKind::X25519, &[9], &[10])),
+        one_time_prekeys: vec![],
+        kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[11], &[12])),
+    };
+
+    svc.register(Request::new(request)).await.unwrap();
+
+    {
+        let mut guard = svc.auth_challenges.lock().await;
+        let challenge = guard.get("frank").cloned().unwrap();
+        guard.insert(
+            "frank".to_string(),
+            AuthChallenge {
+                created_at: challenge.created_at
+                    - (AUTH_CHALLENGE_TTL + Duration::from_secs(1)),
+                data: challenge.data,
+            },
+        );
+    }
+
+    let cleanup = svc.spawn_auth_challenge_cleanup(Duration::from_millis(10));
+    time::sleep(Duration::from_millis(30)).await;
+
+    {
+        let guard = svc.auth_challenges.lock().await;
+        assert!(!guard.contains_key("frank"));
+    }
+    cleanup.abort();
+}
+
+#[tokio::test]
 async fn offline_messages_are_scoped_to_receiver() {
     let svc = test_service().await;
 

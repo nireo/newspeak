@@ -45,6 +45,7 @@ struct AuthChallenge {
 /// AUTH_CHALLENGE_TTL defines how long an auth challenge is valid. since currently the auth
 /// chalenges is kept in memory, it makes sense to clean them up after some time.
 const AUTH_CHALLENGE_TTL: Duration = Duration::from_secs(300);
+const AUTH_CHALLENGE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// OfflineMessageKind represents the type of offline message
 #[derive(Debug, Clone, Copy)]
@@ -152,8 +153,18 @@ impl NewspeakService {
         guard.retain(|_, challenge| challenge.created_at.elapsed() <= AUTH_CHALLENGE_TTL);
     }
 
+    fn spawn_auth_challenge_cleanup(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = time::interval(interval);
+            loop {
+                ticker.tick().await;
+                service.purge_expired_auth_challenges().await;
+            }
+        })
+    }
+
     async fn create_auth_challenge(&self, username: String) -> AuthChallenge {
-        self.purge_expired_auth_challenges().await;
         let data: [u8; 32] = rand::random();
         let now = Instant::now();
 
@@ -1156,6 +1167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_store: ServerStore::new(db),
         auth_challenges: Arc::new(AsyncMutex::new(HashMap::new())),
     };
+    let _auth_cleanup = svc.spawn_auth_challenge_cleanup(AUTH_CHALLENGE_CLEANUP_INTERVAL);
 
     info!(address = %addr, "NewspeakServer listening");
 

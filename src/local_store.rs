@@ -635,8 +635,7 @@ fn stored_user_to_key_exchange_user(stored: StoredUser) -> Result<pqxdh::KeyExch
         .max()
         .map(|id| id.saturating_add(1))
         .unwrap_or(0);
-    let last_resort_id =
-        pqxdh::kem_id_from_key(last_resort_kem.encap_key.as_bytes().as_slice());
+    let last_resort_id = pqxdh::kem_id_from_key(last_resort_kem.encap_key.as_bytes().as_slice());
 
     Ok(pqxdh::KeyExchangeUser {
         identity_sk,
