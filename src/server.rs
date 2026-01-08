@@ -28,25 +28,39 @@ use crate::newspeak::{
     client_message, server_message,
 };
 
+/// AuthChallenge represents an authentication challenge issued to a client during registeration
+/// the point of the auth challenge is to prove possession of the longterm identity key by signing
+/// some arbitrary data and returning the signature to the server.
+///
+/// Since we already have the identity key it makes sense to use it to sign the challenge. However,
+/// this also means that an attacker who manages to compromise the identity key can impersonate the
+/// user during registeration. But since the identity key is longterm and should be kept secure
+/// this is an acceptable risk.
 #[derive(Clone)]
 struct AuthChallenge {
     created_at: time::Instant,
     data: [u8; 32],
 }
 
+/// AUTH_CHALLENGE_TTL defines how long an auth challenge is valid. since currently the auth
+/// chalenges is kept in memory, it makes sense to clean them up after some time.
 const AUTH_CHALLENGE_TTL: Duration = Duration::from_secs(300);
 
+/// OfflineMessageKind represents the type of offline message
+#[derive(Debug, Clone, Copy)]
 enum OfflineMessageKind {
     KeyExchange = 1,
     Regular = 2,
 }
 
+// init_tracing initializes tracing subscriber with environment filter
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+/// log_interceptor logs incoming gRPC requests with method and peer address
 fn log_interceptor(req: Request<()>) -> Result<Request<()>, Status> {
     let peer_addr = req.remote_addr();
     if let Some(method) = req.extensions().get::<GrpcMethod<'static>>() {
@@ -73,28 +87,46 @@ struct NewspeakService {
     auth_challenges: Arc<AsyncMutex<HashMap<String, AuthChallenge>>>,
 }
 
-impl NewspeakService {
-    fn now_timestamp() -> Result<(prost_types::Timestamp, i64), Status> {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|e| Status::internal(format!("system time error: {}", e)))?;
-        let timestamp = prost_types::Timestamp {
-            seconds: now.as_secs() as i64,
-            nanos: 0,
-        };
-        Ok((timestamp, now.as_secs() as i64))
-    }
+/// now_timestamp returns the current system time as a prost_types::Timestamp and unix seconds
+fn now_timestamp() -> Result<(prost_types::Timestamp, i64), Status> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|e| Status::internal(format!("system time error: {}", e)))?;
+    let timestamp = prost_types::Timestamp {
+        seconds: now.as_secs() as i64,
+        nanos: 0,
+    };
+    Ok((timestamp, now.as_secs() as i64))
+}
 
-    fn timestamp_from_unix_secs(seconds: i64) -> Result<prost_types::Timestamp, Status> {
-        if seconds < 0 {
-            return Err(Status::invalid_argument("invalid message timestamp"));
+/// timestamp_from_unix_secs converts unix seconds to prost_types::Timestamp
+fn timestamp_from_unix_secs(seconds: i64) -> Result<prost_types::Timestamp, Status> {
+    if seconds < 0 {
+        return Err(Status::invalid_argument("invalid message timestamp"));
+    }
+    Ok(prost_types::Timestamp { seconds, nanos: 0 })
+}
+
+// implement conversion from client message to offline message kind with a try from
+impl TryFrom<&ClientMessage> for OfflineMessageKind {
+    type Error = Status;
+
+    fn try_from(value: &ClientMessage) -> Result<Self, Self::Error> {
+        match value.message_type {
+            Some(client_message::MessageType::KeyExchangeMessage(_)) => {
+                Ok(OfflineMessageKind::KeyExchange)
+            }
+            Some(client_message::MessageType::EncryptedMessage(_)) => {
+                Ok(OfflineMessageKind::Regular)
+            }
+            _ => Err(Status::invalid_argument("unsupported offline message type")),
         }
-        Ok(prost_types::Timestamp {
-            seconds,
-            nanos: 0,
-        })
     }
+}
 
+impl NewspeakService {
+    /// apply_timestamp_to_client_message applies the given timestamp to the client message if it
+    /// does not already have one.
     fn apply_timestamp_to_client_message(
         message: &mut ClientMessage,
         timestamp: &prost_types::Timestamp,
@@ -111,18 +143,6 @@ impl NewspeakService {
                 }
             }
             _ => {}
-        }
-    }
-
-    fn client_message_kind(message: &ClientMessage) -> Option<OfflineMessageKind> {
-        match message.message_type {
-            Some(client_message::MessageType::KeyExchangeMessage(_)) => {
-                Some(OfflineMessageKind::KeyExchange)
-            }
-            Some(client_message::MessageType::EncryptedMessage(_)) => {
-                Some(OfflineMessageKind::Regular)
-            }
-            _ => None,
         }
     }
 
@@ -197,6 +217,8 @@ impl NewspeakService {
         Ok(())
     }
 
+    /// handle_client_message handles incoming client messages and routes them accordingly to the
+    /// approriate handler based on the message type.
     async fn handle_client_message(
         &self,
         client_message: ClientMessage,
@@ -212,7 +234,7 @@ impl NewspeakService {
             Some(client_message::MessageType::KeyExchangeMessage(message)) => {
                 let target = message.receiver_id.clone();
                 let mut message = message;
-                let (timestamp, created_at) = Self::now_timestamp()?;
+                let (timestamp, created_at) = now_timestamp()?;
                 if message.timestamp.is_none() {
                     message.timestamp = Some(timestamp.clone());
                 }
@@ -229,7 +251,7 @@ impl NewspeakService {
             Some(client_message::MessageType::EncryptedMessage(message)) => {
                 let target = message.receiver_id.clone();
                 let mut message = message;
-                let (timestamp, created_at) = Self::now_timestamp()?;
+                let (timestamp, created_at) = now_timestamp()?;
                 if message.timestamp.is_none() {
                     message.timestamp = Some(timestamp.clone());
                 }
@@ -270,6 +292,8 @@ impl NewspeakService {
         }
     }
 
+    /// handle_join_request handles a join request from a client and adds the user to the active
+    /// users map if the auth challenge is verified successfully.
     async fn handle_join_request(
         &self,
         join_request: newspeak::JoinRequest,
@@ -281,27 +305,40 @@ impl NewspeakService {
             return Err(Status::invalid_argument("username is required"));
         }
 
+        // if the user is already connected reject the join request
+        if users.contains_key(&join_request.username) {
+            return Err(Status::already_exists("username already connected"));
+        }
+
+        // we need to ensure that the auth challenge is successful, otherwise messages could leak
+        // to unauthorized users.
         let signature_bytes: [u8; 64] = join_request
             .signature
             .as_slice()
             .try_into()
             .map_err(|_| Status::unauthenticated("invalid auth signature length"))?;
+
         let signature = ed25519::Signature::from_bytes(&signature_bytes);
         self.verify_auth_challenge(join_request.username.clone(), signature)
             .await?;
 
-        if users.contains_key(&join_request.username) {
-            return Err(Status::already_exists("username already connected"));
-        }
         users.insert(join_request.username.clone(), tx.clone());
 
+        // fetch offline messages for the user and send them as part of the join response
+        // it makes the most sense to send the messages here as this is an authenticated channel
+        // and non authenticated users cannot join the stream. this also simplifies the server
+        // implementation as we don't need a separate route for fetching offline messages.
         let stored_messages = self
             .server_store
             .get_offline_messages(&join_request.username)
             .await?;
         let mut offline_messages = Vec::new();
+
+        // convert messages to protobuf
+        // TODO: make the server store directly return the prost messages to avoid too many
+        // conversions
         for stored in stored_messages {
-            let timestamp = Self::timestamp_from_unix_secs(stored.created_at)?;
+            let timestamp = timestamp_from_unix_secs(stored.created_at)?;
             let mut message = ClientMessage::decode(stored.message.as_slice())
                 .map_err(|_| Status::internal("failed to decode offline message"))?;
             Self::apply_timestamp_to_client_message(&mut message, &timestamp);
@@ -313,7 +350,7 @@ impl NewspeakService {
 
         *active_username = Some(join_request.username);
 
-        let (join_timestamp, _) = Self::now_timestamp()?;
+        let (join_timestamp, _) = now_timestamp()?;
         let _ = tx
             .send(Ok(ServerMessage {
                 message_type: Some(server_message::MessageType::JoinResponse(JoinResponse {
@@ -327,6 +364,7 @@ impl NewspeakService {
         Ok(())
     }
 
+    /// forward_message forwards the given server message to the target user if they are online,
     async fn forward_message(
         &self,
         target: String,
@@ -335,14 +373,17 @@ impl NewspeakService {
         created_at: i64,
         users: &Arc<DashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>,
     ) -> Result<(), Status> {
+        // check if the target user is online
         if let Some(peer_tx) = users.get(&target) {
             let _ = peer_tx.send(Ok(server_message)).await;
             return Ok(());
         }
 
-        let Some(kind) = Self::client_message_kind(&client_message) else {
-            return Err(Status::invalid_argument("unsupported offline message type"));
-        };
+        // the user is offline therefore we need to store the message as an offline message
+        let kind: OfflineMessageKind = (&client_message)
+            .try_into()
+            .map_err(|_| Status::invalid_argument("unsupported offline message type"))?;
+
         let encoded = client_message.encode_to_vec();
         let (sender_username, receiver_username) = match client_message.message_type {
             Some(client_message::MessageType::KeyExchangeMessage(ref msg)) => {
@@ -352,9 +393,12 @@ impl NewspeakService {
                 (msg.sender_id.as_str(), msg.receiver_id.as_str())
             }
             _ => {
-                return Err(Status::invalid_argument("unsupported offline message payload"));
+                return Err(Status::invalid_argument(
+                    "unsupported offline message payload",
+                ));
             }
         };
+
         self.server_store
             .insert_message(
                 kind,
@@ -364,9 +408,12 @@ impl NewspeakService {
                 created_at,
             )
             .await?;
+
         Ok(())
     }
 
+    /// remove_active_user removes the active user from the users map when the stream ends
+    /// or the connection is closed.
     async fn remove_active_user(
         &self,
         users: &Arc<DashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>,
