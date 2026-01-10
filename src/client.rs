@@ -1,23 +1,18 @@
-pub mod local_store;
-pub mod pqxdh;
-pub mod ratchet;
-pub mod newspeak {
-    tonic::include_proto!("newspeak");
-}
-
 use crate::{
     local_store::LocalStorage,
     newspeak::{
+        self,
         AckOfflineMessages, AddSignedPrekeysRequest, ClientMessage, EncryptedMessage,
         FetchPrekeyBundleRequest, InitialMessage, JoinRequest, JoinResponse, KeyKind,
         RatchetMessage as ProtoRatchetMessage, RegisterRequest, ServerMessage, client_message,
         newspeak_client::NewspeakClient, server_message,
     },
     pqxdh::{
+        self,
         KeyExchangeUser, PQXDHInitMessage, PrekeyBundle, PublicSignedMlKemPrekey,
         PublicSignedPrekey,
     },
-    ratchet::{RatchetMessage, RatchetState},
+    ratchet::{self, RatchetMessage, RatchetState},
 };
 use anyhow::{Error, Result, anyhow};
 use chrono::{DateTime, Local};
@@ -893,8 +888,7 @@ async fn run_input_loop(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+pub async fn run() -> Result<()> {
     let (username, receiver_arg) = match parse_args() {
         Ok(args) => args,
         Err(err) => {

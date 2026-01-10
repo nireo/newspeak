@@ -1,6 +1,6 @@
 use super::*;
 use ed25519_dalek::{Signer, SigningKey};
-use newspeak::KeyKind;
+use crate::newspeak::{KeyKind, SignedPrekey};
 use tonic::Code;
 
 fn sample_prekey(kind: KeyKind, key: &[u8], signature: &[u8]) -> SignedPrekey {
