@@ -19,7 +19,7 @@ use crate::{
     },
     ratchet::{RatchetMessage, RatchetState},
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Error, Result, anyhow};
 use chrono::{DateTime, Local};
 use ed25519_dalek::{self as ed25519, Signer};
 use ml_kem::{Encoded, EncodedSizeUser, MlKem1024Params, kem::EncapsulationKey};
@@ -162,7 +162,7 @@ impl<'a> User<'a> {
         let bundle = response
             .bundle
             .ok_or_else(|| anyhow!("missing prekey bundle in response"))?;
-        let prekey_bundle = pqxdh_prekey_bundle_from_proto(&bundle)?;
+        let prekey_bundle = (&bundle).try_into()?;
         let key_info = self.key_info.lock().await;
         let init_output = key_info.init_key_exchange(&prekey_bundle)?;
         let init_message = init_output.message;
@@ -193,104 +193,100 @@ impl<'a> User<'a> {
     }
 }
 
-fn pqxdh_prekey_bundle_from_proto(bundle: &newspeak::PrekeyBundle) -> Result<PrekeyBundle> {
-    let identity_key = parse_ed25519_public_key(&bundle.identity_key)?;
+impl TryFrom<&newspeak::PrekeyBundle> for PrekeyBundle {
+    type Error = Error;
 
-    let signed_prekey = bundle
-        .signed_prekey
-        .as_ref()
-        .ok_or_else(|| anyhow!("missing signed_prekey in bundle"))?;
-    let signed_prekey = parse_x25519_signed_prekey(signed_prekey)?;
+    fn try_from(bundle: &newspeak::PrekeyBundle) -> std::result::Result<Self, Self::Error> {
+        let identity_key =
+            ed25519::VerifyingKey::try_from(bundle.identity_key.as_slice()).map_err(|err| {
+                anyhow!("invalid ed25519 public key: {}", err)
+            })?;
 
-    let kem_encap_key = bundle
-        .kem_encap_key
-        .as_ref()
-        .ok_or_else(|| anyhow!("missing kem_encap_key in bundle"))?;
-    let kem_encap_key = parse_ml_kem_signed_prekey(kem_encap_key)?;
+        let signed_prekey = bundle
+            .signed_prekey
+            .as_ref()
+            .ok_or_else(|| anyhow!("missing signed_prekey in bundle"))?;
+        let signed_prekey: PublicSignedPrekey = signed_prekey.try_into()?;
 
-    let one_time_prekey = bundle
-        .one_time_prekey
-        .as_ref()
-        .map(parse_x25519_signed_prekey)
-        .transpose()?;
+        let kem_encap_key = bundle
+            .kem_encap_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("missing kem_encap_key in bundle"))?;
+        let kem_encap_key: PublicSignedMlKemPrekey = kem_encap_key.try_into()?;
 
-    let kem_id = parse_kem_id(&bundle.kem_id)?;
+        let one_time_prekey = bundle
+            .one_time_prekey
+            .as_ref()
+            .map(TryInto::try_into)
+            .transpose()?;
 
-    Ok(PrekeyBundle::new(
-        signed_prekey,
-        kem_encap_key,
-        identity_key,
-        one_time_prekey,
-        bundle.one_time_prekey_id,
-        kem_id,
-    ))
-}
+        let kem_id: [u8; 16] = bundle
+            .kem_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("invalid kem_id length: {}", bundle.kem_id.len()))?;
 
-fn parse_ed25519_public_key(bytes: &[u8]) -> Result<ed25519::VerifyingKey> {
-    let key_bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow!("invalid ed25519 public key length: {}", bytes.len()))?;
-    ed25519::VerifyingKey::from_bytes(&key_bytes).map_err(|_| anyhow!("invalid ed25519 public key"))
-}
-
-fn parse_ed25519_signature(bytes: &[u8]) -> Result<ed25519::Signature> {
-    let signature_bytes: [u8; 64] = bytes
-        .try_into()
-        .map_err(|_| anyhow!("invalid ed25519 signature length: {}", bytes.len()))?;
-    Ok(ed25519::Signature::from_bytes(&signature_bytes))
-}
-
-fn parse_x25519_public_key(bytes: &[u8]) -> Result<x25519::PublicKey> {
-    let key_bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow!("invalid x25519 public key length: {}", bytes.len()))?;
-    Ok(x25519::PublicKey::from(key_bytes))
-}
-
-fn parse_kem_encapsulation_key(bytes: &[u8]) -> Result<EncapsulationKey<MlKem1024Params>> {
-    let expected = Encoded::<EncapsulationKey<MlKem1024Params>>::default().len();
-    if bytes.len() != expected {
-        return Err(anyhow!(
-            "invalid ML-KEM encapsulation key length: {}",
-            bytes.len()
-        ));
+        Ok(PrekeyBundle::new(
+            signed_prekey,
+            kem_encap_key,
+            identity_key,
+            one_time_prekey,
+            bundle.one_time_prekey_id,
+            kem_id,
+        ))
     }
-
-    let encoded = Encoded::<EncapsulationKey<MlKem1024Params>>::try_from(bytes)
-        .map_err(|_| anyhow!("invalid ML-KEM encapsulation key length: {}", bytes.len()))?;
-    Ok(EncapsulationKey::from_bytes(&encoded))
 }
 
-fn parse_kem_id(bytes: &[u8]) -> Result<[u8; 16]> {
-    bytes
-        .try_into()
-        .map_err(|_| anyhow!("invalid kem_id length: {}", bytes.len()))
-}
+impl TryFrom<&newspeak::SignedPrekey> for PublicSignedPrekey {
+    type Error = Error;
 
-fn parse_x25519_signed_prekey(prekey: &newspeak::SignedPrekey) -> Result<PublicSignedPrekey> {
-    let kind =
-        KeyKind::try_from(prekey.kind).map_err(|_| anyhow!("unknown key kind {}", prekey.kind))?;
-    if kind != KeyKind::X25519 {
-        return Err(anyhow!("expected x25519 signed prekey"));
+    fn try_from(prekey: &newspeak::SignedPrekey) -> Result<Self> {
+        let kind =
+            KeyKind::try_from(prekey.kind).map_err(|_| anyhow!("unknown key kind {}", prekey.kind))?;
+        if kind != KeyKind::X25519 {
+            return Err(anyhow!("expected x25519 signed prekey"));
+        }
+
+        let public_key_bytes: [u8; 32] = prekey
+            .key
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("invalid x25519 public key length: {}", prekey.key.len()))?;
+        let signature = ed25519::Signature::try_from(prekey.signature.as_slice())
+            .map_err(|err| anyhow!("invalid ed25519 signature: {}", err))?;
+
+        Ok(PublicSignedPrekey {
+            public_key: x25519::PublicKey::from(public_key_bytes),
+            signature,
+        })
     }
-
-    Ok(PublicSignedPrekey {
-        public_key: parse_x25519_public_key(&prekey.key)?,
-        signature: parse_ed25519_signature(&prekey.signature)?,
-    })
 }
 
-fn parse_ml_kem_signed_prekey(prekey: &newspeak::SignedPrekey) -> Result<PublicSignedMlKemPrekey> {
-    let kind =
-        KeyKind::try_from(prekey.kind).map_err(|_| anyhow!("unknown key kind {}", prekey.kind))?;
-    if kind != KeyKind::MlKem1024 {
-        return Err(anyhow!("expected ML-KEM-1024 signed prekey"));
-    }
+impl TryFrom<&newspeak::SignedPrekey> for PublicSignedMlKemPrekey {
+    type Error = Error;
 
-    Ok(PublicSignedMlKemPrekey {
-        encap_key: parse_kem_encapsulation_key(&prekey.key)?,
-        signature: parse_ed25519_signature(&prekey.signature)?,
-    })
+    fn try_from(prekey: &newspeak::SignedPrekey) -> Result<Self> {
+        let kind =
+            KeyKind::try_from(prekey.kind).map_err(|_| anyhow!("unknown key kind {}", prekey.kind))?;
+        if kind != KeyKind::MlKem1024 {
+            return Err(anyhow!("expected ML-KEM-1024 signed prekey"));
+        }
+
+        let encoded = Encoded::<EncapsulationKey<MlKem1024Params>>::try_from(prekey.key.as_slice())
+            .map_err(|_| {
+                anyhow!(
+                    "invalid ML-KEM encapsulation key length: {}",
+                    prekey.key.len()
+                )
+            })?;
+        let signature = ed25519::Signature::try_from(prekey.signature.as_slice())
+            .map_err(|err| anyhow!("invalid ed25519 signature: {}", err))?;
+
+        Ok(PublicSignedMlKemPrekey {
+            encap_key: EncapsulationKey::from_bytes(&encoded),
+            signature,
+        })
+    }
 }
 
 fn clear_terminal() {
@@ -321,36 +317,72 @@ fn ratchet_message_to_proto(message: RatchetMessage) -> ProtoRatchetMessage {
     }
 }
 
-fn ratchet_message_from_proto(message: ProtoRatchetMessage) -> Result<RatchetMessage> {
-    let pk = parse_x25519_public_key(&message.public_key)?;
-    if message.message_number < 0 {
-        return Err(anyhow!("invalid ratchet message counter"));
+impl TryFrom<ProtoRatchetMessage> for RatchetMessage {
+    type Error = Error;
+
+    fn try_from(message: ProtoRatchetMessage) -> Result<Self> {
+        let public_key_bytes: [u8; 32] = message
+            .public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                anyhow!(
+                    "invalid x25519 public key length: {}",
+                    message.public_key.len()
+                )
+            })?;
+        let nonce: [u8; 12] = message
+            .nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("invalid ratchet nonce length: {}", message.nonce.len()))?;
+        let counter: u64 = message
+            .message_number
+            .try_into()
+            .map_err(|_| anyhow!("invalid ratchet message counter"))?;
+
+        Ok(RatchetMessage {
+            header: ratchet::RatchetMessageHeader {
+                pk: x25519::PublicKey::from(public_key_bytes),
+                counter,
+                nonce,
+            },
+            ciphertext: message.ciphertext,
+        })
     }
-
-    let nonce: [u8; 12] = message
-        .nonce
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("invalid ratchet nonce length: {}", message.nonce.len()))?;
-
-    Ok(RatchetMessage {
-        header: ratchet::RatchetMessageHeader {
-            pk,
-            counter: message.message_number as u64,
-            nonce,
-        },
-        ciphertext: message.ciphertext,
-    })
 }
 
-fn pqxdh_init_from_proto(message: &InitialMessage) -> Result<PQXDHInitMessage> {
-    Ok(PQXDHInitMessage {
-        peer_identity_public_key: parse_ed25519_public_key(&message.identity_key)?,
-        ephemeral_x25519_public_key: parse_x25519_public_key(&message.ephemeral_key)?,
-        mlkem_ciphertext: message.kem_ciphertext.clone(),
-        kem_used: parse_kem_id(&message.kem_id)?,
-        one_time_prekey_used: message.one_time_prekey_id,
-    })
+impl TryFrom<&InitialMessage> for PQXDHInitMessage {
+    type Error = Error;
+
+    fn try_from(message: &InitialMessage) -> Result<Self> {
+        let peer_identity_public_key =
+            ed25519::VerifyingKey::try_from(message.identity_key.as_slice())
+                .map_err(|err| anyhow!("invalid ed25519 public key: {}", err))?;
+        let ephemeral_key_bytes: [u8; 32] = message
+            .ephemeral_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                anyhow!(
+                    "invalid x25519 public key length: {}",
+                    message.ephemeral_key.len()
+                )
+            })?;
+        let kem_used: [u8; 16] = message
+            .kem_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("invalid kem_id length: {}", message.kem_id.len()))?;
+
+        Ok(PQXDHInitMessage {
+            peer_identity_public_key,
+            ephemeral_x25519_public_key: x25519::PublicKey::from(ephemeral_key_bytes),
+            mlkem_ciphertext: message.kem_ciphertext.clone(),
+            kem_used,
+            one_time_prekey_used: message.one_time_prekey_id,
+        })
+    }
 }
 
 fn now_unix_seconds() -> i64 {
@@ -409,7 +441,7 @@ async fn handle_key_exchange_message(
         return;
     };
 
-    let init = match pqxdh_init_from_proto(init_message) {
+    let init = match PQXDHInitMessage::try_from(init_message) {
         Ok(init) => init,
         Err(err) => {
             eprintln!("failed to parse key exchange: {}", err);
@@ -492,7 +524,7 @@ async fn handle_encrypted_message(
         eprintln!("missing ratchet message");
         return;
     };
-    let ratchet_message = match ratchet_message_from_proto(inner) {
+    let ratchet_message = match RatchetMessage::try_from(inner) {
         Ok(msg) => msg,
         Err(err) => {
             eprintln!("invalid ratchet message: {}", err);
