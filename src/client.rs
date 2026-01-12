@@ -30,6 +30,20 @@ use x25519_dalek as x25519;
 
 type StdinLines = tokio::io::Lines<BufReader<io::Stdin>>;
 
+struct ActiveConversation {
+    receiver: String,
+    ratchet_state: Option<RatchetState>,
+}
+
+impl ActiveConversation {
+    fn new(receiver: String, ratchet_state: Option<RatchetState>) -> Self {
+        Self {
+            receiver,
+            ratchet_state,
+        }
+    }
+}
+
 struct User<'a> {
     username: &'a str,
     key_info: Arc<Mutex<KeyExchangeUser>>,
@@ -426,7 +440,7 @@ fn server_message_from_client_message(message: ClientMessage) -> Option<ServerMe
 async fn handle_key_exchange_message(
     message: newspeak::KeyExchangeMessage,
     key_info: &Arc<Mutex<KeyExchangeUser>>,
-    ratchet_state: &Arc<Mutex<Option<RatchetState>>>,
+    active_conversation: &Arc<Mutex<ActiveConversation>>,
     storage: &LocalStorage,
     username: &str,
 ) {
@@ -490,31 +504,42 @@ async fn handle_key_exchange_message(
     ratchet.sending_sk = sending_sk;
     ratchet.sending_pk = x25519::PublicKey::from(&ratchet.sending_sk);
 
-    let mut guard = ratchet_state.lock().await;
-    *guard = Some(ratchet);
-    if let Some(state) = guard.as_ref() {
-        if let Err(err) = storage
-            .update_conversation(username, &message.sender_id, state)
-            .await
-        {
-            eprintln!("failed to update conversation: {}", err);
-        }
+    if let Err(err) = storage
+        .update_conversation(username, &message.sender_id, &ratchet)
+        .await
+    {
+        eprintln!("failed to update conversation: {}", err);
     }
 
+    let is_current = {
+        let guard = active_conversation.lock().await;
+        guard.receiver == message.sender_id
+    };
+    if is_current {
+        let mut guard = active_conversation.lock().await;
+        guard.ratchet_state = Some(ratchet);
+    }
+
+    let notice = if is_current {
+        format!("key exchange completed with {}", message.sender_id)
+    } else {
+        format!("key exchange completed with {} (stored)", message.sender_id)
+    };
     print_incoming(&format_chat_line(
         timestamp,
         "system",
-        &format!("key exchange completed with {}", message.sender_id),
+        &notice,
     ));
 }
 
 async fn handle_encrypted_message(
     message: newspeak::EncryptedMessage,
-    ratchet_state: &Arc<Mutex<Option<RatchetState>>>,
+    active_conversation: &Arc<Mutex<ActiveConversation>>,
     storage: &LocalStorage,
     username: &str,
 ) {
     let timestamp = timestamp_seconds(message.timestamp.as_ref());
+    let sender_id = message.sender_id.clone();
     let Some(inner) = message.ratchet_message else {
         eprintln!("missing ratchet message");
         return;
@@ -526,35 +551,78 @@ async fn handle_encrypted_message(
             return;
         }
     };
-    let mut guard = ratchet_state.lock().await;
-    if guard.is_none() {
-        if let Ok(Some(state)) = storage.get_conversation(username, &message.sender_id).await {
-            *guard = Some(state);
+    let is_current = {
+        let guard = active_conversation.lock().await;
+        guard.receiver == sender_id
+    };
+    if is_current {
+        let mut guard = active_conversation.lock().await;
+        if guard.ratchet_state.is_none() {
+            if let Ok(Some(state)) = storage.get_conversation(username, &sender_id).await {
+                guard.ratchet_state = Some(state);
+            }
         }
+        if let Some(ratchet) = guard.ratchet_state.as_mut() {
+            match ratchet.receive_message(ratchet_message, RATCHET_AD) {
+                Ok(plaintext) => {
+                    print_incoming(&format_chat_line(timestamp, &sender_id, &plaintext));
+                    if let Err(err) = storage
+                        .add_message(username, &sender_id, &plaintext, false, timestamp)
+                        .await
+                    {
+                        eprintln!("failed to store message: {}", err);
+                    }
+                    if let Err(err) = storage
+                        .update_conversation(username, &sender_id, ratchet)
+                        .await
+                    {
+                        eprintln!("failed to update conversation: {}", err);
+                    }
+                }
+                Err(err) => {
+                    println!("failed to receive mesesage: {}", err.to_string());
+                }
+            }
+        } else {
+            eprintln!("received message before key exchange");
+        }
+        return;
     }
-    if let Some(ratchet) = guard.as_mut() {
-        match ratchet.receive_message(ratchet_message, RATCHET_AD) {
-            Ok(plaintext) => {
-                print_incoming(&format_chat_line(timestamp, &message.sender_id, &plaintext));
-                if let Err(err) = storage
-                    .add_message(username, &message.sender_id, &plaintext, false, timestamp)
-                    .await
-                {
-                    eprintln!("failed to store message: {}", err);
-                }
-                if let Err(err) = storage
-                    .update_conversation(username, &message.sender_id, ratchet)
-                    .await
-                {
-                    eprintln!("failed to update conversation: {}", err);
-                }
-            }
-            Err(err) => {
-                println!("failed to receive mesesage: {}", err.to_string());
-            }
+
+    let mut ratchet = match storage.get_conversation(username, &sender_id).await {
+        Ok(Some(state)) => state,
+        Ok(None) => {
+            eprintln!("received message before key exchange");
+            return;
         }
-    } else {
-        eprintln!("received message before key exchange");
+        Err(err) => {
+            eprintln!("failed to load conversation: {}", err);
+            return;
+        }
+    };
+    match ratchet.receive_message(ratchet_message, RATCHET_AD) {
+        Ok(plaintext) => {
+            if let Err(err) = storage
+                .add_message(username, &sender_id, &plaintext, false, timestamp)
+                .await
+            {
+                eprintln!("failed to store message: {}", err);
+            }
+            if let Err(err) = storage
+                .update_conversation(username, &sender_id, &ratchet)
+                .await
+            {
+                eprintln!("failed to update conversation: {}", err);
+            }
+            print_incoming(&format_chat_line(
+                timestamp,
+                "system",
+                &format!("new message from {} (stored)", sender_id),
+            ));
+        }
+        Err(err) => {
+            println!("failed to receive mesesage: {}", err.to_string());
+        }
     }
 }
 
@@ -669,10 +737,82 @@ async fn load_conversation_history(
     Ok(stored_conversation)
 }
 
+async fn prompt_switch_conversation(
+    lines: &mut StdinLines,
+    username: &str,
+    active_conversation: &Arc<Mutex<ActiveConversation>>,
+    storage: &LocalStorage,
+) -> Result<()> {
+    let current = {
+        let guard = active_conversation.lock().await;
+        guard.receiver.clone()
+    };
+    let mut conversations = storage.get_user_conversations(username).await?;
+    if !conversations.iter().any(|name| name == &current) {
+        conversations.push(current.clone());
+    }
+    conversations.sort();
+
+    println!("available conversations:");
+    for convo in &conversations {
+        if convo == &current {
+            println!("  {} (current)", convo);
+        } else {
+            println!("  {}", convo);
+        }
+    }
+    println!("type a username to switch (or press Enter to cancel):");
+
+    let Some(input) = lines.next_line().await? else {
+        return Ok(());
+    };
+    let choice = input.trim();
+    if choice.is_empty() || choice == current {
+        print_incoming(&format_chat_line(
+            now_unix_seconds(),
+            "system",
+            "staying on current conversation",
+        ));
+        return Ok(());
+    }
+    if !conversations.iter().any(|name| name == choice) {
+        print_incoming(&format_chat_line(
+            now_unix_seconds(),
+            "system",
+            "unknown conversation; staying on current",
+        ));
+        return Ok(());
+    }
+
+    let stored_conversation = load_conversation_history(storage, username, choice).await?;
+    if stored_conversation.is_none() {
+        print_incoming(&format_chat_line(
+            now_unix_seconds(),
+            "system",
+            "missing conversation state; staying on current",
+        ));
+        return Ok(());
+    }
+
+    {
+        let mut guard = active_conversation.lock().await;
+        guard.receiver = choice.to_string();
+        guard.ratchet_state = None;
+    }
+
+    print_incoming(&format_chat_line(
+        now_unix_seconds(),
+        "system",
+        &format!("switched to {}", choice),
+    ));
+
+    Ok(())
+}
+
 async fn handle_join_response(
     join: JoinResponse,
     key_info: &Arc<Mutex<KeyExchangeUser>>,
-    ratchet_state: &Arc<Mutex<Option<RatchetState>>>,
+    active_conversation: &Arc<Mutex<ActiveConversation>>,
     storage: &LocalStorage,
     username: &str,
     tx: &mpsc::Sender<ClientMessage>,
@@ -701,11 +841,17 @@ async fn handle_join_response(
         };
         match server_message.message_type {
             Some(server_message::MessageType::KeyExchange(message)) => {
-                handle_key_exchange_message(message, key_info, ratchet_state, storage, username)
-                    .await;
+                handle_key_exchange_message(
+                    message,
+                    key_info,
+                    active_conversation,
+                    storage,
+                    username,
+                )
+                .await;
             }
             Some(server_message::MessageType::Encrypted(message)) => {
-                handle_encrypted_message(message, ratchet_state, storage, username).await;
+                handle_encrypted_message(message, active_conversation, storage, username).await;
             }
             _ => {}
         }
@@ -727,7 +873,7 @@ async fn handle_join_response(
 fn spawn_inbound_task(
     mut inbound: tonic::Streaming<ServerMessage>,
     key_info: Arc<Mutex<KeyExchangeUser>>,
-    ratchet_state: Arc<Mutex<Option<RatchetState>>>,
+    active_conversation: Arc<Mutex<ActiveConversation>>,
     storage: LocalStorage,
     username: String,
     tx: mpsc::Sender<ClientMessage>,
@@ -736,12 +882,12 @@ fn spawn_inbound_task(
     tokio::spawn(async move {
         while let Some(message) = inbound.message().await.transpose() {
             match message {
-                Ok(server_message) => match server_message.message_type {
+                    Ok(server_message) => match server_message.message_type {
                     Some(server_message::MessageType::JoinResponse(join)) => {
                         handle_join_response(
                             join,
                             &key_info,
-                            &ratchet_state,
+                            &active_conversation,
                             &storage,
                             &username,
                             &tx,
@@ -755,14 +901,14 @@ fn spawn_inbound_task(
                         handle_key_exchange_message(
                             message,
                             &key_info,
-                            &ratchet_state,
+                            &active_conversation,
                             &storage,
                             &username,
                         )
                         .await;
                     }
                     Some(server_message::MessageType::Encrypted(message)) => {
-                        handle_encrypted_message(message, &ratchet_state, &storage, &username)
+                        handle_encrypted_message(message, &active_conversation, &storage, &username)
                             .await;
                     }
                     None => {
@@ -782,7 +928,7 @@ async fn initiate_key_exchange_if_needed(
     user: &mut User<'_>,
     username: &str,
     receiver: &str,
-    ratchet_state: &Arc<Mutex<Option<RatchetState>>>,
+    active_conversation: &Arc<Mutex<ActiveConversation>>,
     storage: &LocalStorage,
     tx: &mpsc::Sender<ClientMessage>,
     has_conversation: bool,
@@ -791,19 +937,22 @@ async fn initiate_key_exchange_if_needed(
         return Ok(());
     }
 
-    if ratchet_state.lock().await.is_some() {
-        return Ok(());
+    {
+        let guard = active_conversation.lock().await;
+        if guard.ratchet_state.is_some() {
+            return Ok(());
+        }
     }
 
     let (key_message, r_state) = user
         .create_key_exchange_message(receiver.to_string())
         .await?;
-    let mut guard = ratchet_state.lock().await;
-    *guard = Some(r_state);
-    if let Some(state) = guard.as_ref() {
-        storage
-            .update_conversation(username, receiver, state)
-            .await?;
+    storage
+        .update_conversation(username, receiver, &r_state)
+        .await?;
+    {
+        let mut guard = active_conversation.lock().await;
+        guard.ratchet_state = Some(r_state);
     }
 
     tx.send(ClientMessage {
@@ -823,23 +972,48 @@ async fn initiate_key_exchange_if_needed(
 async fn run_input_loop(
     lines: &mut StdinLines,
     username: &str,
-    receiver: &str,
-    ratchet_state: &Arc<Mutex<Option<RatchetState>>>,
+    active_conversation: &Arc<Mutex<ActiveConversation>>,
     storage: &LocalStorage,
     tx: &mpsc::Sender<ClientMessage>,
 ) -> Result<()> {
     while let Some(line) = lines.next_line().await? {
-        if line == "exit" {
+        let trimmed = line.trim();
+        if trimmed == "exit" {
             break;
         }
 
-        if line.is_empty() {
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed == "/switch" {
+            if let Err(err) =
+                prompt_switch_conversation(lines, username, active_conversation, storage).await
+            {
+                print_incoming(&format_chat_line(
+                    now_unix_seconds(),
+                    "system",
+                    &format!("switch failed: {}", err),
+                ));
+            }
             continue;
         }
 
         let timestamp = now_unix_seconds();
-        let mut guard = ratchet_state.lock().await;
-        if let Some(state) = guard.as_mut() {
+        let mut guard = active_conversation.lock().await;
+        let receiver = guard.receiver.clone();
+        if guard.ratchet_state.is_none() {
+            match storage.get_conversation(username, &receiver).await {
+                Ok(Some(state)) => {
+                    guard.ratchet_state = Some(state);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    eprintln!("failed to load conversation: {}", err);
+                }
+            }
+        }
+        if let Some(state) = guard.ratchet_state.as_mut() {
             let msg = match state.send_message(&line, RATCHET_AD) {
                 Ok(msg) => msg,
                 Err(err) => {
@@ -857,17 +1031,17 @@ async fn run_input_loop(
             };
             let rpc_message = EncryptedMessage {
                 sender_id: username.to_string(),
-                receiver_id: receiver.to_string(),
+                receiver_id: receiver.clone(),
                 ratchet_message: Some(ratchet_message_to_proto(msg)),
                 timestamp: Some(message_timestamp.clone()),
             };
             if let Err(err) = storage
-                .add_message(username, receiver, &line, true, timestamp)
+                .add_message(username, &receiver, &line, true, timestamp)
                 .await
             {
                 eprintln!("failed to store message: {}", err);
             }
-            if let Err(err) = storage.update_conversation(username, receiver, state).await {
+            if let Err(err) = storage.update_conversation(username, &receiver, state).await {
                 eprintln!("failed to update conversation: {}", err);
             }
 
@@ -918,12 +1092,15 @@ pub async fn run() -> Result<()> {
     let stored_conversation = load_conversation_history(&storage, &username, &receiver).await?;
     let found_conversation = stored_conversation.is_some();
 
-    let ratchet_state = Arc::new(Mutex::new(stored_conversation));
+    let active_conversation = Arc::new(Mutex::new(ActiveConversation::new(
+        receiver.clone(),
+        stored_conversation,
+    )));
     let (joined_tx, joined_rx) = oneshot::channel();
     spawn_inbound_task(
         inbound,
         Arc::clone(&user.key_info),
-        Arc::clone(&ratchet_state),
+        Arc::clone(&active_conversation),
         storage.clone(),
         username.clone(),
         tx.clone(),
@@ -938,7 +1115,7 @@ pub async fn run() -> Result<()> {
         &mut user,
         &username,
         &receiver,
-        &ratchet_state,
+        &active_conversation,
         &storage,
         &tx,
         found_conversation,
@@ -948,8 +1125,7 @@ pub async fn run() -> Result<()> {
     run_input_loop(
         &mut lines,
         &username,
-        &receiver,
-        &ratchet_state,
+        &active_conversation,
         &storage,
         &tx,
     )
