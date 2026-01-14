@@ -1,15 +1,13 @@
 use crate::{
     local_store::LocalStorage,
     newspeak::{
-        self,
-        AckOfflineMessages, AddSignedPrekeysRequest, ClientMessage, EncryptedMessage,
+        self, AckOfflineMessages, AddSignedPrekeysRequest, ClientMessage, EncryptedMessage,
         FetchPrekeyBundleRequest, InitialMessage, JoinRequest, JoinResponse, KeyKind,
         RatchetMessage as ProtoRatchetMessage, RegisterRequest, ServerMessage, client_message,
         newspeak_client::NewspeakClient, server_message,
     },
     pqxdh::{
-        self,
-        KeyExchangeUser, PQXDHInitMessage, PrekeyBundle, PublicSignedMlKemPrekey,
+        self, KeyExchangeUser, PQXDHInitMessage, PrekeyBundle, PublicSignedMlKemPrekey,
         PublicSignedPrekey,
     },
     ratchet::{self, RatchetMessage, RatchetState},
@@ -30,6 +28,8 @@ use x25519_dalek as x25519;
 
 type StdinLines = tokio::io::Lines<BufReader<io::Stdin>>;
 
+/// ActiveConversation represents a conversation with some receiver and its associated ratchet
+/// state.
 struct ActiveConversation {
     receiver: String,
     ratchet_state: Option<RatchetState>,
@@ -44,6 +44,7 @@ impl ActiveConversation {
     }
 }
 
+/// User represents a client user with associated key info and gRPC client.
 struct User<'a> {
     username: &'a str,
     key_info: Arc<Mutex<KeyExchangeUser>>,
@@ -93,6 +94,8 @@ impl<'a> User<'a> {
         }
     }
 
+    /// register sends the registration request to the server and processes the response.
+    /// It also adds any unused one-time prekeys to the server.
     pub async fn register(&mut self) -> Result<()> {
         let (identity_key, signed_prekey, kem_prekey, one_time_prekeys, kem_prekeys) = {
             let key_info = self.key_info.lock().await;
@@ -148,6 +151,8 @@ impl<'a> User<'a> {
         Ok(())
     }
 
+    /// sign_auth_challenge signs the stored authentication challenge using the user's identity
+    /// signing key. This allows authentication without having to store passwords on the server.
     pub async fn sign_auth_challenge(&self) -> Result<Vec<u8>> {
         let challenge = self
             .auth_challenge
@@ -157,6 +162,9 @@ impl<'a> User<'a> {
         Ok(signature.to_bytes().to_vec())
     }
 
+    /// create_key_exchange_message creates a key exchange message to initiate a conversation with
+    /// some other user. It fetches their prekey bundle from the server and then constructs a
+    /// shared secret and initial message using local keys and the given prekey bundle keys.
     pub async fn create_key_exchange_message(
         &mut self,
         other: String,
@@ -182,6 +190,8 @@ impl<'a> User<'a> {
             prekey_bundle.signed_prekey.public_key.clone(),
         );
 
+        // the initial message contains all information that the receiver needs to complete the key
+        // exchange and end up with the same shared secret.
         let initial_message = newspeak::InitialMessage {
             identity_key: init_message.peer_identity_public_key.as_bytes().to_vec(),
             ephemeral_key: init_message.ephemeral_x25519_public_key.as_bytes().to_vec(),
@@ -206,10 +216,8 @@ impl TryFrom<&newspeak::PrekeyBundle> for PrekeyBundle {
     type Error = Error;
 
     fn try_from(bundle: &newspeak::PrekeyBundle) -> std::result::Result<Self, Self::Error> {
-        let identity_key =
-            ed25519::VerifyingKey::try_from(bundle.identity_key.as_slice()).map_err(|err| {
-                anyhow!("invalid ed25519 public key: {}", err)
-            })?;
+        let identity_key = ed25519::VerifyingKey::try_from(bundle.identity_key.as_slice())
+            .map_err(|err| anyhow!("invalid ed25519 public key: {}", err))?;
 
         let signed_prekey = bundle
             .signed_prekey
@@ -250,8 +258,8 @@ impl TryFrom<&newspeak::SignedPrekey> for PublicSignedPrekey {
     type Error = Error;
 
     fn try_from(prekey: &newspeak::SignedPrekey) -> Result<Self> {
-        let kind =
-            KeyKind::try_from(prekey.kind).map_err(|_| anyhow!("unknown key kind {}", prekey.kind))?;
+        let kind = KeyKind::try_from(prekey.kind)
+            .map_err(|_| anyhow!("unknown key kind {}", prekey.kind))?;
         if kind != KeyKind::X25519 {
             return Err(anyhow!("expected x25519 signed prekey"));
         }
@@ -275,8 +283,8 @@ impl TryFrom<&newspeak::SignedPrekey> for PublicSignedMlKemPrekey {
     type Error = Error;
 
     fn try_from(prekey: &newspeak::SignedPrekey) -> Result<Self> {
-        let kind =
-            KeyKind::try_from(prekey.kind).map_err(|_| anyhow!("unknown key kind {}", prekey.kind))?;
+        let kind = KeyKind::try_from(prekey.kind)
+            .map_err(|_| anyhow!("unknown key kind {}", prekey.kind))?;
         if kind != KeyKind::MlKem1024 {
             return Err(anyhow!("expected ML-KEM-1024 signed prekey"));
         }
@@ -316,13 +324,15 @@ fn print_outgoing(message: &str) {
     let _ = std::io::stdout().flush();
 }
 
-fn ratchet_message_to_proto(message: RatchetMessage) -> ProtoRatchetMessage {
-    ProtoRatchetMessage {
-        public_key: message.header.pk.as_bytes().to_vec(),
-        previous_chain_length: 0,
-        message_number: message.header.counter as i32,
-        ciphertext: message.ciphertext,
-        nonce: message.header.nonce.to_vec(),
+impl From<ratchet::RatchetMessage> for ProtoRatchetMessage {
+    fn from(message: ratchet::RatchetMessage) -> Self {
+        ProtoRatchetMessage {
+            public_key: message.header.pk.as_bytes().to_vec(),
+            previous_chain_length: 0,
+            message_number: message.header.counter as i32,
+            ciphertext: message.ciphertext,
+            nonce: message.header.nonce.to_vec(),
+        }
     }
 }
 
@@ -330,11 +340,8 @@ impl TryFrom<ProtoRatchetMessage> for RatchetMessage {
     type Error = Error;
 
     fn try_from(message: ProtoRatchetMessage) -> Result<Self> {
-        let public_key_bytes: [u8; 32] = message
-            .public_key
-            .as_slice()
-            .try_into()
-            .map_err(|_| {
+        let public_key_bytes: [u8; 32] =
+            message.public_key.as_slice().try_into().map_err(|_| {
                 anyhow!(
                     "invalid x25519 public key length: {}",
                     message.public_key.len()
@@ -368,11 +375,8 @@ impl TryFrom<&InitialMessage> for PQXDHInitMessage {
         let peer_identity_public_key =
             ed25519::VerifyingKey::try_from(message.identity_key.as_slice())
                 .map_err(|err| anyhow!("invalid ed25519 public key: {}", err))?;
-        let ephemeral_key_bytes: [u8; 32] = message
-            .ephemeral_key
-            .as_slice()
-            .try_into()
-            .map_err(|_| {
+        let ephemeral_key_bytes: [u8; 32] =
+            message.ephemeral_key.as_slice().try_into().map_err(|_| {
                 anyhow!(
                     "invalid x25519 public key length: {}",
                     message.ephemeral_key.len()
@@ -525,11 +529,7 @@ async fn handle_key_exchange_message(
     } else {
         format!("key exchange completed with {} (stored)", message.sender_id)
     };
-    print_incoming(&format_chat_line(
-        timestamp,
-        "system",
-        &notice,
-    ));
+    print_incoming(&format_chat_line(timestamp, "system", &notice));
 }
 
 async fn handle_encrypted_message(
@@ -676,6 +676,8 @@ fn stdin_lines() -> StdinLines {
     reader.lines()
 }
 
+/// select_receiver selects the conversation receiver based on the provided argument or by
+/// prompting the user to choose from existing conversations.
 async fn select_receiver(
     username: &str,
     receiver_arg: Option<String>,
@@ -687,6 +689,7 @@ async fn select_receiver(
     }
 }
 
+/// setup_message_stream sets up the gRPC message stream with the server for the given user.
 async fn setup_message_stream(
     user: &User<'_>,
 ) -> Result<(mpsc::Sender<ClientMessage>, tonic::Streaming<ServerMessage>)> {
@@ -699,6 +702,8 @@ async fn setup_message_stream(
     Ok((tx, response.into_inner()))
 }
 
+/// send_join_request sends a join request to the server with the user's signed authentication
+/// challenge.
 async fn send_join_request(user: &User<'_>, tx: &mpsc::Sender<ClientMessage>) -> Result<()> {
     let auth_signature = user.sign_auth_challenge().await?;
     tx.send(ClientMessage {
@@ -711,6 +716,8 @@ async fn send_join_request(user: &User<'_>, tx: &mpsc::Sender<ClientMessage>) ->
     Ok(())
 }
 
+/// load_conversation_history loads the conversation history with a given receiver from local
+/// storage.
 async fn load_conversation_history(
     storage: &LocalStorage,
     username: &str,
@@ -737,6 +744,9 @@ async fn load_conversation_history(
     Ok(stored_conversation)
 }
 
+/// prompt_switch_conversation prompts the user to switch to a different conversation.
+/// It lists available conversations and updates the active conversation state if a valid
+/// choice is made.
 async fn prompt_switch_conversation(
     lines: &mut StdinLines,
     username: &str,
@@ -809,6 +819,8 @@ async fn prompt_switch_conversation(
     Ok(())
 }
 
+/// handle_join_response processes the join response from the server, printing any messages
+/// and handling offline messages if present.
 async fn handle_join_response(
     join: JoinResponse,
     key_info: &Arc<Mutex<KeyExchangeUser>>,
@@ -870,6 +882,8 @@ async fn handle_join_response(
     }
 }
 
+/// spawn_inbound_task spawns a Tokio task to handle incoming server messages from the gRPC stream.
+/// It processes different message types and updates the local state accordingly.
 fn spawn_inbound_task(
     mut inbound: tonic::Streaming<ServerMessage>,
     key_info: Arc<Mutex<KeyExchangeUser>>,
@@ -882,7 +896,7 @@ fn spawn_inbound_task(
     tokio::spawn(async move {
         while let Some(message) = inbound.message().await.transpose() {
             match message {
-                    Ok(server_message) => match server_message.message_type {
+                Ok(server_message) => match server_message.message_type {
                     Some(server_message::MessageType::JoinResponse(join)) => {
                         handle_join_response(
                             join,
@@ -908,8 +922,13 @@ fn spawn_inbound_task(
                         .await;
                     }
                     Some(server_message::MessageType::Encrypted(message)) => {
-                        handle_encrypted_message(message, &active_conversation, &storage, &username)
-                            .await;
+                        handle_encrypted_message(
+                            message,
+                            &active_conversation,
+                            &storage,
+                            &username,
+                        )
+                        .await;
                     }
                     None => {
                         eprintln!("server sent an empty message");
@@ -924,6 +943,9 @@ fn spawn_inbound_task(
     });
 }
 
+/// initiate_key_exchange_if_needed checks if a key exchange is needed for the current conversation
+/// and initiates it if necessary. It updates the local storage and active conversation state
+/// accordingly, and sends the key exchange message to the server.
 async fn initiate_key_exchange_if_needed(
     user: &mut User<'_>,
     username: &str,
@@ -969,6 +991,8 @@ async fn initiate_key_exchange_if_needed(
     Ok(())
 }
 
+/// run_input_loop handles the main input loop for reading user input from stdin, processing
+/// commands, and sending messages.
 async fn run_input_loop(
     lines: &mut StdinLines,
     username: &str,
@@ -1013,6 +1037,7 @@ async fn run_input_loop(
                 }
             }
         }
+
         if let Some(state) = guard.ratchet_state.as_mut() {
             let msg = match state.send_message(&line, RATCHET_AD) {
                 Ok(msg) => msg,
@@ -1032,7 +1057,7 @@ async fn run_input_loop(
             let rpc_message = EncryptedMessage {
                 sender_id: username.to_string(),
                 receiver_id: receiver.clone(),
-                ratchet_message: Some(ratchet_message_to_proto(msg)),
+                ratchet_message: Some(msg.into()),
                 timestamp: Some(message_timestamp.clone()),
             };
             if let Err(err) = storage
@@ -1041,7 +1066,10 @@ async fn run_input_loop(
             {
                 eprintln!("failed to store message: {}", err);
             }
-            if let Err(err) = storage.update_conversation(username, &receiver, state).await {
+            if let Err(err) = storage
+                .update_conversation(username, &receiver, state)
+                .await
+            {
                 eprintln!("failed to update conversation: {}", err);
             }
 
@@ -1062,7 +1090,15 @@ async fn run_input_loop(
     Ok(())
 }
 
+/// run is the main entry point for the client application. It handles user login, conversation
+/// selection, key exchange initiation, and the main input loop for sending and receiving messages.
 pub async fn run() -> Result<()> {
+    // the user can of course set any username they want, but they cannot impersonate others
+    // without having access to their signing keys as the server verifies signatures when joining a
+    // stream.
+    //
+    // TODO: currently they could keep spamming the register route to prevent a legitimate user
+    // from registering. there should be some blocking in place to prevent abuse.
     let (username, receiver_arg) = match parse_args() {
         Ok(args) => args,
         Err(err) => {
@@ -1072,7 +1108,6 @@ pub async fn run() -> Result<()> {
     };
 
     let client = NewspeakClient::connect("http://[::1]:10000").await?;
-
     let storage = LocalStorage::new(&username).await?;
     let key_info = storage.load_or_create_user(&username).await?;
     let mut user = User::new(&username, client, key_info);
@@ -1111,6 +1146,7 @@ pub async fn run() -> Result<()> {
         let _ = joined_rx.await;
     }
 
+    // ensure that a key exchange is initiated if there is no existing conversation state
     initiate_key_exchange_if_needed(
         &mut user,
         &username,
@@ -1122,14 +1158,6 @@ pub async fn run() -> Result<()> {
     )
     .await?;
 
-    run_input_loop(
-        &mut lines,
-        &username,
-        &active_conversation,
-        &storage,
-        &tx,
-    )
-    .await?;
-
+    run_input_loop(&mut lines, &username, &active_conversation, &storage, &tx).await?;
     Ok(())
 }
