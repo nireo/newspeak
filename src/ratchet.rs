@@ -6,6 +6,9 @@ use chacha20poly1305::{
 use x25519_dalek as ecdh;
 use x25519_dalek as x25519;
 
+/// RatchetState represents a conversation state between two parties. It holds the sending and
+/// receiving public keys, counters, root key, and chain keys for both sending and receiving.
+/// This is described by Signal's Double Ratchet Algorithm spec.
 pub struct RatchetState {
     pub sending_sk: ecdh::StaticSecret,
     pub sending_pk: ecdh::PublicKey,
@@ -18,12 +21,15 @@ pub struct RatchetState {
     pub chain_key_receiving: [u8; 32],
 }
 
+/// Ratchet message header contains the public key, message counter, and nonce. Here the nonce is
+/// 96 bits which is fine since we use a unique key for each message.
 pub struct RatchetMessageHeader {
     pub pk: ecdh::PublicKey,
     pub counter: u64,
     pub nonce: [u8; 12],
 }
 
+/// RatchetMessageHeader contains the header and the actual content of the message being decrypted.
 pub struct RatchetMessage {
     pub header: RatchetMessageHeader,
     pub ciphertext: Vec<u8>,
@@ -56,20 +62,30 @@ impl RatchetState {
         }
     }
 
-    pub fn as_initiator(&mut self, shared_key: [u8; 32], other_pk: ecdh::PublicKey) {
-        self.receiving_pk = Some(other_pk);
+    pub fn as_initiator(shared_key: [u8; 32], other_pk: ecdh::PublicKey) -> RatchetState {
+        let mut state = RatchetState::new();
+        state.receiving_pk = Some(other_pk);
 
-        (self.root_key, self.chain_key_sending) = kdf_root_key(
+        (state.root_key, state.chain_key_sending) = kdf_root_key(
             &shared_key,
-            self.sending_sk.diffie_hellman(&self.receiving_pk.unwrap()), // unwrap fine since we
-                                                                         // set the value above
-        )
+            state
+                .sending_sk
+                .diffie_hellman(&state.receiving_pk.unwrap()), // unwrap fine since we
+                                                               // set the value above
+        );
+
+        state
     }
 
-    pub fn as_receiver(&mut self, shared_key: [u8; 32]) {
-        self.root_key = shared_key;
+    pub fn as_receiver(shared_key: [u8; 32]) -> RatchetState {
+        let mut state = RatchetState::new();
+        state.root_key = shared_key;
+
+        state
     }
 
+    /// send_message encrypts a message using the current sending chain key and returns a
+    /// RatchetMessage. It also updates the sending chain key and counter.
     pub fn send_message(
         &mut self,
         message: &str,

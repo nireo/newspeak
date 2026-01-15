@@ -4,7 +4,7 @@ use std::path::Path;
 use ed25519_dalek::Signer;
 use ml_kem::{Encoded, EncodedSizeUser, MlKem1024Params, kem::DecapsulationKey};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool};
 use x25519_dalek as x25519;
 
 use crate::pqxdh;
@@ -33,7 +33,101 @@ struct StoredUser {
     ec_store: Option<KeyStore<u32, SignedPrekey>>,
 }
 
+type SqliteQuery<'a> = sqlx::query::Query<'a, Sqlite, sqlx::sqlite::SqliteArguments<'a>>;
+
+enum LocalKeyTable {
+    Kem,
+    Ec,
+}
+
+impl LocalKeyTable {
+    fn name(&self) -> &'static str {
+        match self {
+            LocalKeyTable::Kem => "kem_keys",
+            LocalKeyTable::Ec => "ec_keys",
+        }
+    }
+
+    fn key_column(&self) -> &'static str {
+        match self {
+            LocalKeyTable::Kem => "decap",
+            LocalKeyTable::Ec => "sk",
+        }
+    }
+}
+
+enum LocalKeyId {
+    Blob(Vec<u8>),
+    Int(i64),
+}
+
+impl LocalKeyId {
+    fn bind<'a>(&'a self, query: SqliteQuery<'a>) -> SqliteQuery<'a> {
+        match self {
+            LocalKeyId::Blob(val) => query.bind(val.as_slice()),
+            LocalKeyId::Int(val) => query.bind(*val),
+        }
+    }
+}
+
 impl LocalStorage {
+    async fn insert_key_rows(
+        &self,
+        username: &str,
+        rows: Vec<(LocalKeyId, Vec<u8>, i64)>,
+        table: LocalKeyTable,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let username = username.to_string();
+        let sql = format!(
+            "INSERT INTO {} (
+                id,
+                username,
+                {},
+                used
+            ) VALUES (?1, ?2, ?3, ?4)",
+            table.name(),
+            table.key_column()
+        );
+
+        let mut tx = self.db.begin().await?;
+        for (id, key_bytes, used) in rows {
+            let query = sqlx::query(&sql);
+            let query = id
+                .bind(query)
+                .bind(&username)
+                .bind(&key_bytes)
+                .bind(used);
+            query.execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn mark_key_used(
+        &self,
+        username: &str,
+        id: LocalKeyId,
+        table: LocalKeyTable,
+    ) -> Result<()> {
+        let username = username.to_string();
+        let sql = format!(
+            "UPDATE {}
+             SET used = 1
+             WHERE username = ?1 AND id = ?2",
+            table.name()
+        );
+
+        let mut tx = self.db.begin().await?;
+        let query = sqlx::query(&sql).bind(&username);
+        let query = id.bind(query);
+        query.execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn new(username: &str) -> Result<Self> {
         Self::new_with_path(format!("{}_newspeak.db", username)).await
     }
@@ -159,9 +253,6 @@ impl LocalStorage {
         username: &str,
         keys: &pqxdh::KeyStore<pqxdh::KemId, pqxdh::SignedMlKemPrekey>,
     ) -> Result<()> {
-        if keys.len() == 0 {
-            return Ok(());
-        }
         let rows: Vec<(pqxdh::KemId, Vec<u8>, i64)> = keys
             .iter()
             .map(|(id, key, used)| {
@@ -172,30 +263,12 @@ impl LocalStorage {
                 )
             })
             .collect();
-        let username = username.to_string();
-
-        {
-            let mut tx = self.db.begin().await?;
-            for (id, key_bytes, used) in rows {
-                sqlx::query(
-                    "INSERT INTO kem_keys (
-                        id,
-                        username,
-                        decap,
-                        used
-                    ) VALUES (?1, ?2, ?3, ?4)",
-                )
-                .bind(id.to_vec())
-                .bind(&username)
-                .bind(&key_bytes)
-                .bind(used)
-                .execute(&mut *tx)
-                .await?;
-            }
-            tx.commit().await?;
-        }
-
-        Ok(())
+        let rows = rows
+            .into_iter()
+            .map(|(id, key_bytes, used)| (LocalKeyId::Blob(id.to_vec()), key_bytes, used))
+            .collect();
+        self.insert_key_rows(username, rows, LocalKeyTable::Kem)
+            .await
     }
 
     async fn insert_ec_keys(
@@ -203,9 +276,6 @@ impl LocalStorage {
         username: &str,
         keys: &pqxdh::KeyStore<u32, pqxdh::SignedPrekey>,
     ) -> Result<()> {
-        if keys.len() == 0 {
-            return Ok(());
-        }
         let rows: Vec<(u32, Vec<u8>, i64)> = keys
             .iter()
             .map(|(id, key, used)| {
@@ -216,30 +286,11 @@ impl LocalStorage {
                 )
             })
             .collect();
-        let username = username.to_string();
-
-        {
-            let mut tx = self.db.begin().await?;
-            for (id, key_bytes, used) in rows {
-                sqlx::query(
-                    "INSERT INTO ec_keys (
-                        id,
-                        username,
-                        sk,
-                        used
-                    ) VALUES (?1, ?2, ?3, ?4)",
-                )
-                .bind(id as i64)
-                .bind(&username)
-                .bind(&key_bytes)
-                .bind(used)
-                .execute(&mut *tx)
-                .await?;
-            }
-            tx.commit().await?;
-        }
-
-        Ok(())
+        let rows = rows
+            .into_iter()
+            .map(|(id, key_bytes, used)| (LocalKeyId::Int(i64::from(id)), key_bytes, used))
+            .collect();
+        self.insert_key_rows(username, rows, LocalKeyTable::Ec).await
     }
 
     pub async fn get_user_kem_keys(
@@ -330,35 +381,17 @@ impl LocalStorage {
     }
 
     pub async fn mark_ec_key_used(&self, username: &str, id: u32) -> Result<()> {
-        let username = username.to_string();
-        let mut tx = self.db.begin().await?;
-        sqlx::query(
-            "UPDATE ec_keys
-             SET used = 1
-             WHERE username = ?1 AND id = ?2",
-        )
-        .bind(&username)
-        .bind(i64::from(id))
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
+        self.mark_key_used(username, LocalKeyId::Int(i64::from(id)), LocalKeyTable::Ec)
+            .await
     }
 
     pub async fn mark_kem_key_used(&self, username: &str, id: &KemId) -> Result<()> {
-        let username = username.to_string();
-        let mut tx = self.db.begin().await?;
-        sqlx::query(
-            "UPDATE kem_keys
-             SET used = 1
-             WHERE username = ?1 AND id = ?2",
+        self.mark_key_used(
+            username,
+            LocalKeyId::Blob(id.to_vec()),
+            LocalKeyTable::Kem,
         )
-        .bind(&username)
-        .bind(id.to_vec())
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
+        .await
     }
 
     pub async fn get_conversation(

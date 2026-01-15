@@ -1,6 +1,32 @@
 use super::SignerMut;
 use super::*;
 
+impl KeyExchangeUser {
+    fn make_prekey(&self) -> PrekeyBundle {
+        let one_time_prekey = self.one_time_keys.first_unused();
+        let one_time_kem_key = self.one_time_kem_keys.first_unused();
+        let mut bundle = PrekeyBundle {
+            signed_prekey: PublicSignedPrekey::from(&self.signed_prekey),
+            kem_prekey: PublicSignedMlKemPrekey::from(&self.last_resort_kem),
+            identity_pk: self.identity_pk,
+            one_time_prekey: None,
+            one_time_prekey_id: None,
+            kem_id: self.last_resort_id,
+        };
+
+        if let Some(signed_prekey) = one_time_prekey {
+            bundle.one_time_prekey_id = Some(*signed_prekey.0);
+            bundle.one_time_prekey = Some(PublicSignedPrekey::from(&signed_prekey.1.key));
+        }
+        if let Some(kem_prekey) = one_time_kem_key {
+            bundle.kem_id = *kem_prekey.0;
+            bundle.kem_prekey = PublicSignedMlKemPrekey::from(&kem_prekey.1.key);
+        }
+
+        bundle
+    }
+}
+
 #[test]
 fn pqxdh_round_trip_shared_secret_matches() {
     let alice = KeyExchangeUser::new();

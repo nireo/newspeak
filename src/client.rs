@@ -184,8 +184,7 @@ impl<'a> User<'a> {
         let init_output = key_info.init_key_exchange(&prekey_bundle)?;
         let init_message = init_output.message;
 
-        let mut ratchet_state = RatchetState::new();
-        ratchet_state.as_initiator(
+        let ratchet_state = RatchetState::as_initiator(
             init_output.secret_key.clone(),
             prekey_bundle.signed_prekey.public_key.clone(),
         );
@@ -503,8 +502,7 @@ async fn handle_key_exchange_message(
         }
     }
 
-    let mut ratchet = RatchetState::new();
-    ratchet.as_receiver(shared_key);
+    let mut ratchet = RatchetState::as_receiver(shared_key);
     ratchet.sending_sk = sending_sk;
     ratchet.sending_pk = x25519::PublicKey::from(&ratchet.sending_sk);
 

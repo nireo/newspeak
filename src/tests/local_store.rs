@@ -156,8 +156,7 @@ async fn insert_user_persists_keys() -> Result<()> {
     let signed_prekey = pqxdh::SignedPrekey::new(&mut rng, &mut identity_sk);
     let last_resort_kem = pqxdh::SignedMlKemPrekey::new(&mut rng, &mut identity_sk);
 
-    let last_resort_id =
-        pqxdh::kem_id_from_key(last_resort_kem.encap_key.as_bytes().as_slice());
+    let last_resort_id = pqxdh::kem_id_from_key(last_resort_kem.encap_key.as_bytes().as_slice());
     let user = pqxdh::KeyExchangeUser {
         identity_sk,
         identity_pk,
@@ -192,9 +191,9 @@ async fn conversation_roundtrip() -> Result<()> {
     storage.load_or_create_user("alice").await?;
 
     let shared_key: [u8; 32] = rand::random();
-    let mut alice = RatchetState::new();
     let bob = RatchetState::new();
-    alice.as_initiator(shared_key, bob.sending_pk);
+
+    let mut alice = RatchetState::as_initiator(shared_key, bob.sending_pk);
     let _ = alice.send_message("hello", b"ratchet-ad")?;
 
     storage.update_conversation("alice", "bob", &alice).await?;
@@ -223,9 +222,9 @@ async fn update_conversation_overwrites_state() -> Result<()> {
     storage.load_or_create_user("alice").await?;
 
     let shared_key: [u8; 32] = rand::random();
-    let mut alice = RatchetState::new();
     let bob = RatchetState::new();
-    alice.as_initiator(shared_key, bob.sending_pk);
+
+    let mut alice = RatchetState::as_initiator(shared_key, bob.sending_pk);
     storage.update_conversation("alice", "bob", &alice).await?;
 
     let _ = alice.send_message("hello", b"ratchet-ad")?;
@@ -248,9 +247,8 @@ async fn conversation_messages_roundtrip() -> Result<()> {
     storage.load_or_create_user("alice").await?;
 
     let shared_key: [u8; 32] = rand::random();
-    let mut alice = RatchetState::new();
     let bob = RatchetState::new();
-    alice.as_initiator(shared_key, bob.sending_pk);
+    let alice = RatchetState::as_initiator(shared_key, bob.sending_pk);
     storage.update_conversation("alice", "bob", &alice).await?;
 
     storage
@@ -279,14 +277,13 @@ async fn get_user_conversations_lists_peers() -> Result<()> {
     storage.load_or_create_user("alice").await?;
 
     let shared_key: [u8; 32] = rand::random();
-    let mut alice = RatchetState::new();
     let bob = RatchetState::new();
-    alice.as_initiator(shared_key, bob.sending_pk);
+    let alice = RatchetState::as_initiator(shared_key, bob.sending_pk);
     storage.update_conversation("alice", "bob", &alice).await?;
 
-    let mut alice2 = RatchetState::new();
     let charlie = RatchetState::new();
-    alice2.as_initiator(shared_key, charlie.sending_pk);
+    let alice2 = RatchetState::as_initiator(shared_key, charlie.sending_pk);
+
     storage
         .update_conversation("alice", "charlie", &alice2)
         .await?;
