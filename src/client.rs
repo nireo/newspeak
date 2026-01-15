@@ -1,5 +1,5 @@
 use crate::{
-    local_store::LocalStorage,
+    local_store::{LocalStorage, PeerIdentityStoreResult},
     newspeak::{
         self, AckOfflineMessages, AddSignedPrekeysRequest, ClientMessage, EncryptedMessage,
         FetchPrekeyBundleRequest, InitialMessage, JoinRequest, JoinResponse, KeyKind,
@@ -11,6 +11,7 @@ use crate::{
         PublicSignedPrekey,
     },
     ratchet::{self, RatchetMessage, RatchetState},
+    verification,
 };
 use anyhow::{Error, Result, anyhow};
 use chrono::{DateTime, Local};
@@ -168,7 +169,7 @@ impl<'a> User<'a> {
     pub async fn create_key_exchange_message(
         &mut self,
         other: String,
-    ) -> Result<(newspeak::KeyExchangeMessage, RatchetState)> {
+    ) -> Result<(newspeak::KeyExchangeMessage, RatchetState, [u8; 32])> {
         let receiver_id = other.clone();
         let response = self
             .client
@@ -179,7 +180,8 @@ impl<'a> User<'a> {
         let bundle = response
             .bundle
             .ok_or_else(|| anyhow!("missing prekey bundle in response"))?;
-        let prekey_bundle = (&bundle).try_into()?;
+        let prekey_bundle: PrekeyBundle = (&bundle).try_into()?;
+        let peer_identity = *prekey_bundle.identity_pk.as_bytes();
         let key_info = self.key_info.lock().await;
         let init_output = key_info.init_key_exchange(&prekey_bundle)?;
         let init_message = init_output.message;
@@ -207,6 +209,7 @@ impl<'a> User<'a> {
                 timestamp: None,
             },
             ratchet_state,
+            peer_identity,
         ))
     }
 }
@@ -321,6 +324,26 @@ fn print_outgoing(message: &str) {
     print!("\x1b[1A\r\x1b[2K");
     println!("{}", message);
     let _ = std::io::stdout().flush();
+}
+
+fn print_safety_number(peer: &str, safety_number: &str, verified: bool) {
+    let timestamp = now_unix_seconds();
+    let status = if verified { "verified" } else { "unverified" };
+    print_incoming(&format_chat_line(
+        timestamp,
+        "system",
+        &format!(
+            "safety number with {} ({}): {}",
+            peer, status, safety_number
+        ),
+    ));
+    if !verified {
+        print_incoming(&format_chat_line(
+            timestamp,
+            "system",
+            "verify out-of-band and then run /verify",
+        ));
+    }
 }
 
 impl From<ratchet::RatchetMessage> for ProtoRatchetMessage {
@@ -461,7 +484,7 @@ async fn handle_key_exchange_message(
         }
     };
 
-    let (shared_key, sending_sk, one_time_prekey_used, kem_used, last_resort_id) = {
+    let (shared_key, sending_sk, one_time_prekey_used, kem_used, last_resort_id, local_identity) = {
         let mut key_info = key_info.lock().await;
         let shared_key = match key_info.receive_key_exchange(&init) {
             Ok(shared_key) => shared_key,
@@ -484,8 +507,37 @@ async fn handle_key_exchange_message(
             one_time_prekey_used,
             kem_used,
             key_info.last_resort_id,
+            key_info.identity_pk.to_bytes(),
         )
     };
+
+    let peer_identity = init.peer_identity_public_key.to_bytes();
+    let store_result = match storage
+        .store_peer_identity(username, &message.sender_id, &peer_identity)
+        .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            eprintln!("failed to store peer identity: {}", err);
+            return;
+        }
+    };
+    if matches!(store_result, PeerIdentityStoreResult::ExistingMismatch) {
+        eprintln!(
+            "identity key mismatch for {}; refusing to accept key exchange",
+            message.sender_id
+        );
+        return;
+    }
+    let show_safety = match store_result {
+        PeerIdentityStoreResult::Inserted => true,
+        PeerIdentityStoreResult::ExistingMatch { verified } => !verified,
+        PeerIdentityStoreResult::ExistingMismatch => false,
+    };
+    if show_safety {
+        let safety_number = verification::safety_number_string(&local_identity, &peer_identity);
+        print_safety_number(&message.sender_id, &safety_number, false);
+    }
 
     // mark the keys separately not to hold the mutex down. it doesn't really matter though since
     // these are mainly local db operations which are really fast. just as a note. also makes sense
@@ -538,6 +590,7 @@ async fn handle_encrypted_message(
 ) {
     let timestamp = timestamp_seconds(message.timestamp.as_ref());
     let sender_id = message.sender_id.clone();
+    let aad = ratchet_aad(message.sender_id.as_str(), message.receiver_id.as_str());
     let Some(inner) = message.ratchet_message else {
         eprintln!("missing ratchet message");
         return;
@@ -561,7 +614,7 @@ async fn handle_encrypted_message(
             }
         }
         if let Some(ratchet) = guard.ratchet_state.as_mut() {
-            match ratchet.receive_message(ratchet_message, RATCHET_AD) {
+            match ratchet.receive_message(ratchet_message, &aad) {
                 Ok(plaintext) => {
                     print_incoming(&format_chat_line(timestamp, &sender_id, &plaintext));
                     if let Err(err) = storage
@@ -598,7 +651,7 @@ async fn handle_encrypted_message(
             return;
         }
     };
-    match ratchet.receive_message(ratchet_message, RATCHET_AD) {
+    match ratchet.receive_message(ratchet_message, &aad) {
         Ok(plaintext) => {
             if let Err(err) = storage
                 .add_message(username, &sender_id, &plaintext, false, timestamp)
@@ -624,7 +677,56 @@ async fn handle_encrypted_message(
     }
 }
 
-const RATCHET_AD: &[u8] = b"ratchet-ad";
+const RATCHET_AAD_DOMAIN: &[u8] = b"newspeak-ratchet-aad-v1";
+
+// Bind message metadata to the AEAD to prevent in-transit tampering.
+fn ratchet_aad(sender_id: &str, receiver_id: &str) -> Vec<u8> {
+    let sender_len = sender_id.len() as u32;
+    let receiver_len = receiver_id.len() as u32;
+    let mut aad = Vec::with_capacity(
+        RATCHET_AAD_DOMAIN.len() + 1 + 4 + sender_id.len() + 4 + receiver_id.len(),
+    );
+    aad.extend_from_slice(RATCHET_AAD_DOMAIN);
+    aad.push(0);
+    aad.extend_from_slice(&sender_len.to_le_bytes());
+    aad.extend_from_slice(sender_id.as_bytes());
+    aad.extend_from_slice(&receiver_len.to_le_bytes());
+    aad.extend_from_slice(receiver_id.as_bytes());
+    aad
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ratchet_aad_allows_valid_metadata() {
+        let shared_key: [u8; 32] = rand::random();
+        let mut bob = RatchetState::as_receiver(shared_key);
+        let bob_pk = x25519::PublicKey::from(&bob.sending_sk);
+        let mut alice = RatchetState::as_initiator(shared_key, bob_pk);
+
+        let aad = ratchet_aad("alice", "bob");
+        let message = alice.send_message("hello", &aad).unwrap();
+
+        let plaintext = bob.receive_message(message, &aad).unwrap();
+        assert_eq!(plaintext, "hello");
+    }
+
+    #[test]
+    fn ratchet_aad_rejects_mismatched_metadata() {
+        let shared_key: [u8; 32] = rand::random();
+        let mut bob = RatchetState::as_receiver(shared_key);
+        let bob_pk = x25519::PublicKey::from(&bob.sending_sk);
+        let mut alice = RatchetState::as_initiator(shared_key, bob_pk);
+
+        let aad = ratchet_aad("alice", "bob");
+        let message = alice.send_message("secret", &aad).unwrap();
+
+        let wrong_aad = ratchet_aad("alice", "carol");
+        assert!(bob.receive_message(message, &wrong_aad).is_err());
+    }
+}
 
 async fn choose_conversation(username: &str, store: &LocalStorage) -> anyhow::Result<String> {
     let conversations = store.get_user_conversations(username).await?;
@@ -964,9 +1066,31 @@ async fn initiate_key_exchange_if_needed(
         }
     }
 
-    let (key_message, r_state) = user
+    let (key_message, r_state, peer_identity) = user
         .create_key_exchange_message(receiver.to_string())
         .await?;
+    let store_result = storage
+        .store_peer_identity(username, receiver, &peer_identity)
+        .await?;
+    if matches!(store_result, PeerIdentityStoreResult::ExistingMismatch) {
+        return Err(anyhow!(
+            "identity key mismatch for {}; refusing to start conversation",
+            receiver
+        ));
+    }
+    let show_safety = match store_result {
+        PeerIdentityStoreResult::Inserted => true,
+        PeerIdentityStoreResult::ExistingMatch { verified } => !verified,
+        PeerIdentityStoreResult::ExistingMismatch => false,
+    };
+    if show_safety {
+        let local_identity = {
+            let key_info = user.key_info.lock().await;
+            key_info.identity_pk.to_bytes()
+        };
+        let safety_number = verification::safety_number_string(&local_identity, &peer_identity);
+        print_safety_number(receiver, &safety_number, false);
+    }
     storage
         .update_conversation(username, receiver, &r_state)
         .await?;
@@ -1021,6 +1145,37 @@ async fn run_input_loop(
             continue;
         }
 
+        if trimmed == "/verify" {
+            let receiver = {
+                let guard = active_conversation.lock().await;
+                guard.receiver.clone()
+            };
+            match storage.mark_peer_identity_verified(username, &receiver).await {
+                Ok(true) => {
+                    print_incoming(&format_chat_line(
+                        now_unix_seconds(),
+                        "system",
+                        &format!("marked {} as verified", receiver),
+                    ));
+                }
+                Ok(false) => {
+                    print_incoming(&format_chat_line(
+                        now_unix_seconds(),
+                        "system",
+                        "no identity on record for this peer",
+                    ));
+                }
+                Err(err) => {
+                    print_incoming(&format_chat_line(
+                        now_unix_seconds(),
+                        "system",
+                        &format!("verification failed: {}", err),
+                    ));
+                }
+            }
+            continue;
+        }
+
         let timestamp = now_unix_seconds();
         let mut guard = active_conversation.lock().await;
         let receiver = guard.receiver.clone();
@@ -1037,7 +1192,12 @@ async fn run_input_loop(
         }
 
         if let Some(state) = guard.ratchet_state.as_mut() {
-            let msg = match state.send_message(&line, RATCHET_AD) {
+            let message_timestamp = Timestamp {
+                seconds: timestamp,
+                nanos: 0,
+            };
+            let aad = ratchet_aad(username, &receiver);
+            let msg = match state.send_message(&line, &aad) {
                 Ok(msg) => msg,
                 Err(err) => {
                     println!(
@@ -1048,10 +1208,6 @@ async fn run_input_loop(
                 }
             };
 
-            let message_timestamp = Timestamp {
-                seconds: timestamp,
-                nanos: 0,
-            };
             let rpc_message = EncryptedMessage {
                 sender_id: username.to_string(),
                 receiver_id: receiver.clone(),

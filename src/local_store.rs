@@ -20,6 +20,17 @@ pub struct ConversationMessage {
     pub timestamp: i64,
 }
 
+pub struct PeerIdentity {
+    pub identity_key: [u8; 32],
+    pub verified: bool,
+}
+
+pub enum PeerIdentityStoreResult {
+    Inserted,
+    ExistingMatch { verified: bool },
+    ExistingMismatch,
+}
+
 #[derive(Clone)]
 pub struct LocalStorage {
     db: SqlitePool,
@@ -553,6 +564,95 @@ impl LocalStorage {
         Ok(rows.into_iter().map(|row| row.get(0)).collect())
     }
 
+    pub async fn get_peer_identity(
+        &self,
+        username: &str,
+        peer: &str,
+    ) -> Result<Option<PeerIdentity>> {
+        let username = username.to_string();
+        let peer = peer.to_string();
+        let row = sqlx::query(
+            "SELECT identity_key, verified
+             FROM peer_identities
+             WHERE username = ?1 AND peer = ?2",
+        )
+        .bind(&username)
+        .bind(&peer)
+        .fetch_optional(&self.db)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let identity_key: Vec<u8> = row.get(0);
+        let verified: i64 = row.get(1);
+
+        Ok(Some(PeerIdentity {
+            identity_key: bytes_to_32(&identity_key)?,
+            verified: verified != 0,
+        }))
+    }
+
+    pub async fn store_peer_identity(
+        &self,
+        username: &str,
+        peer: &str,
+        identity_key: &[u8],
+    ) -> Result<PeerIdentityStoreResult> {
+        let identity_key = bytes_to_32(identity_key)?;
+        if let Some(existing) = self.get_peer_identity(username, peer).await? {
+            if existing.identity_key != identity_key {
+                return Ok(PeerIdentityStoreResult::ExistingMismatch);
+            }
+            return Ok(PeerIdentityStoreResult::ExistingMatch {
+                verified: existing.verified,
+            });
+        }
+
+        let username = username.to_string();
+        let peer = peer.to_string();
+        let mut tx = self.db.begin().await?;
+        sqlx::query(
+            "INSERT INTO peer_identities (
+                username,
+                peer,
+                identity_key,
+                verified
+            ) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(&username)
+        .bind(&peer)
+        .bind(identity_key.as_slice())
+        .bind(0i64)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok(PeerIdentityStoreResult::Inserted)
+    }
+
+    pub async fn mark_peer_identity_verified(
+        &self,
+        username: &str,
+        peer: &str,
+    ) -> Result<bool> {
+        let username = username.to_string();
+        let peer = peer.to_string();
+        let mut tx = self.db.begin().await?;
+        let result = sqlx::query(
+            "UPDATE peer_identities
+             SET verified = 1
+             WHERE username = ?1 AND peer = ?2",
+        )
+        .bind(&username)
+        .bind(&peer)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn init_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         // some thoughts on the schema: for a relational format it makes more sense to store the
         // user like this, overall sqlite is very reliable and a good also for internal storage in
@@ -621,6 +721,18 @@ impl LocalStorage {
                 is_sender INTEGER NOT NULL,
                 timestamp INTEGER NOT NULL,
                 FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+            );",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS peer_identities(
+                username TEXT NOT NULL,
+                peer TEXT NOT NULL,
+                identity_key BLOB NOT NULL,
+                verified INTEGER NOT NULL,
+                UNIQUE (username, peer),
+                FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
             );",
         )
         .execute(pool)

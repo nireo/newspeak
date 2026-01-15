@@ -62,6 +62,9 @@ impl RatchetState {
         }
     }
 
+    // as_initiator initializes the RatchetState for the initiator of the conversation. It takes a shared key and
+    // the public key of the other party. It performs the initial Diffie-Hellman exchange to derive
+    // the root key and sending chain key.
     pub fn as_initiator(shared_key: [u8; 32], other_pk: ecdh::PublicKey) -> RatchetState {
         let mut state = RatchetState::new();
         state.receiving_pk = Some(other_pk);
@@ -77,6 +80,8 @@ impl RatchetState {
         state
     }
 
+    // as_receiver initializes the RatchetState for the receiver of the conversation. It takes a
+    // shared key.
     pub fn as_receiver(shared_key: [u8; 32]) -> RatchetState {
         let mut state = RatchetState::new();
         state.root_key = shared_key;
@@ -124,6 +129,9 @@ impl RatchetState {
         Ok(message)
     }
 
+    /// receive_message decrypts a RatchetMessage using the current receiving chain key. If the
+    /// public key in the message header is different from the current receiving public key, it
+    /// performs a ratchet step to update the root key and chain keys.
     pub fn receive_message(
         &mut self,
         message: RatchetMessage,
@@ -175,6 +183,8 @@ impl RatchetState {
     }
 }
 
+/// kdf_root_key derives a new root key and chain key from the current root key and a shared
+/// secret obtained from a Diffie-Hellman exchange.
 fn kdf_root_key(key: &[u8; 32], shared_secret: ecdh::SharedSecret) -> ([u8; 32], [u8; 32]) {
     let mut kdf = blake3::Hasher::new_derive_key("DOUBLE_RATCHET_KDF_ROOT_KEY");
     kdf.update(key);
@@ -190,8 +200,7 @@ fn kdf_root_key(key: &[u8; 32], shared_secret: ecdh::SharedSecret) -> ([u8; 32],
     return (root_key, chain_key);
 }
 
-// input: chain_key
-// output: (chain_key, message_key)
+/// kdf_chain_key derives a new chain key and message key from the current chain key.
 fn kdf_chain_key(key: &[u8]) -> ([u8; 32], [u8; 32]) {
     let mut kdf = blake3::Hasher::new_derive_key("DOUBLE_RATCHET_KDF_CHAIN_KEY");
     kdf.update(key);
