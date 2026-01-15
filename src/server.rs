@@ -95,6 +95,14 @@ fn timestamp_from_unix_secs(seconds: i64) -> Result<prost_types::Timestamp, Stat
     Ok(prost_types::Timestamp { seconds, nanos: 0 })
 }
 
+fn identity_pk_from_user(user: &ServerUser) -> Result<VerifyingKey, Status> {
+    let identity_key_bytes: [u8; 32] = user.identity_key.as_slice().try_into().map_err(|_| {
+        Status::internal("stored identity key has invalid length, database corrupted")
+    })?;
+    VerifyingKey::from_bytes(&identity_key_bytes)
+        .map_err(|_| Status::internal("stored identity key is invalid, database corrupted"))
+}
+
 // implement conversion from client message to offline message kind with a try from
 impl TryFrom<&ClientMessage> for OfflineMessageKind {
     type Error = Status;
@@ -132,6 +140,41 @@ impl NewspeakService {
             }
             _ => {}
         }
+    }
+
+    async fn handle_forwardable_message(
+        &self,
+        message_type: client_message::MessageType,
+        users: &Arc<DashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>,
+    ) -> Result<(), Status> {
+        let mut client_message = ClientMessage {
+            message_type: Some(message_type),
+        };
+        let (timestamp, created_at) = now_timestamp()?;
+        Self::apply_timestamp_to_client_message(&mut client_message, &timestamp);
+
+        let (target, server_message) = match client_message.message_type.as_ref() {
+            Some(client_message::MessageType::KeyExchangeMessage(inner)) => (
+                inner.receiver_id.clone(),
+                ServerMessage {
+                    message_type: Some(server_message::MessageType::KeyExchange(inner.clone())),
+                },
+            ),
+            Some(client_message::MessageType::EncryptedMessage(inner)) => (
+                inner.receiver_id.clone(),
+                ServerMessage {
+                    message_type: Some(server_message::MessageType::Encrypted(inner.clone())),
+                },
+            ),
+            _ => {
+                return Err(Status::invalid_argument(
+                    "unsupported offline message type",
+                ));
+            }
+        };
+
+        self.forward_message(target, server_message, client_message, created_at, users)
+            .await
     }
 
     async fn purge_expired_auth_challenges(&self) {
@@ -193,14 +236,7 @@ impl NewspeakService {
         };
 
         let user = self.server_store.get_user(username.clone()).await?;
-        let identity_key_bytes: [u8; 32] =
-            user.identity_key.as_slice().try_into().map_err(|_| {
-                Status::internal("stored identity key has invalid length, database corrupted")
-            })?;
-
-        // we need to verify that the identity_key matches
-        let identity_pk = VerifyingKey::from_bytes(&identity_key_bytes)
-            .map_err(|_| Status::internal("stored identity key is invalid, database corrupted"))?;
+        let identity_pk = identity_pk_from_user(&user)?;
 
         identity_pk
             .verify_strict(&chall.data, &signature)
@@ -230,44 +266,24 @@ impl NewspeakService {
                     .await
             }
             Some(client_message::MessageType::KeyExchangeMessage(message)) => {
-                let target = message.receiver_id.clone();
-                let mut message = message;
-                let (timestamp, created_at) = now_timestamp()?;
-                if message.timestamp.is_none() {
-                    message.timestamp = Some(timestamp.clone());
-                }
-                let server_message = ServerMessage {
-                    message_type: Some(server_message::MessageType::KeyExchange(message.clone())),
-                };
-                let client_message = ClientMessage {
-                    message_type: Some(client_message::MessageType::KeyExchangeMessage(message)),
-                };
-                self.forward_message(target, server_message, client_message, created_at, users)
-                    .await?;
-                Ok(())
+                self.handle_forwardable_message(
+                    client_message::MessageType::KeyExchangeMessage(message),
+                    users,
+                )
+                .await
             }
             Some(client_message::MessageType::EncryptedMessage(message)) => {
-                let target = message.receiver_id.clone();
-                let mut message = message;
-                let (timestamp, created_at) = now_timestamp()?;
-                if message.timestamp.is_none() {
-                    message.timestamp = Some(timestamp.clone());
-                }
                 if let Some(ratchet) = message.ratchet_message.as_ref() {
                     debug!(
                         ciphertext_len = ratchet.ciphertext.len(),
                         "received encrypted message"
                     );
                 }
-                let server_message = ServerMessage {
-                    message_type: Some(server_message::MessageType::Encrypted(message.clone())),
-                };
-                let client_message = ClientMessage {
-                    message_type: Some(client_message::MessageType::EncryptedMessage(message)),
-                };
-                self.forward_message(target, server_message, client_message, created_at, users)
-                    .await?;
-                Ok(())
+                self.handle_forwardable_message(
+                    client_message::MessageType::EncryptedMessage(message),
+                    users,
+                )
+                .await
             }
             Some(client_message::MessageType::AckOfflineMessages(ack)) => {
                 let Some(username) = active_username.clone() else {
@@ -499,15 +515,7 @@ impl Newspeak for NewspeakService {
 
         // fetch user identity key to verify prekeys
         let user = self.server_store.get_user(request.username).await?;
-
-        let identity_key_bytes: [u8; 32] =
-            user.identity_key.as_slice().try_into().map_err(|_| {
-                Status::internal("stored identity key has invalid length, database corrupted")
-            })?;
-
-        // we need to verify that the identity_key matches
-        let identity_pk = VerifyingKey::from_bytes(&identity_key_bytes)
-            .map_err(|_| Status::internal("stored identity key is invalid, database corrupted"))?;
+        let identity_pk = identity_pk_from_user(&user)?;
 
         let mut x25519_keys = Vec::new();
         let mut kem_keys = Vec::new();
