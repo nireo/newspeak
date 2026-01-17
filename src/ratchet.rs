@@ -3,8 +3,27 @@ use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit,
     aead::{AeadMut, Payload},
 };
+use std::collections::HashMap;
 use x25519_dalek as ecdh;
 use x25519_dalek as x25519;
+
+const MAX_SKIPPED_MESSAGES: u64 = 128;
+const MAX_SKIPPED_KEYS: usize = 128;
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub struct SkippedKeyId {
+    pk: [u8; 32],
+    counter: u64,
+}
+
+impl SkippedKeyId {
+    fn new(pk: &ecdh::PublicKey, counter: u64) -> Self {
+        Self {
+            pk: *pk.as_bytes(),
+            counter,
+        }
+    }
+}
 
 /// RatchetState represents a conversation state between two parties. It holds the sending and
 /// receiving public keys, counters, root key, and chain keys for both sending and receiving.
@@ -19,6 +38,7 @@ pub struct RatchetState {
     pub root_key: [u8; 32],
     pub chain_key_sending: [u8; 32],
     pub chain_key_receiving: [u8; 32],
+    pub skipped_message_keys: HashMap<SkippedKeyId, [u8; 32]>,
 }
 
 /// Ratchet message header contains the public key, message counter, and nonce. Here the nonce is
@@ -59,6 +79,7 @@ impl RatchetState {
             root_key: [0u8; 32],
             chain_key_sending: [0u8; 32],
             chain_key_receiving: [0u8; 32],
+            skipped_message_keys: HashMap::new(),
         }
     }
 
@@ -137,9 +158,15 @@ impl RatchetState {
         message: RatchetMessage,
         aditionnal_data: &[u8],
     ) -> Result<String> {
+        if let Some(message_key) = self.take_skipped_key(&message.header.pk, message.header.counter)
+        {
+            return self.decrypt_message(&message, aditionnal_data, &message_key);
+        }
+
         if self.receiving_pk != Some(message.header.pk) {
             // state.DHr = header.dh
             self.receiving_pk = Some(message.header.pk);
+            self.receiving_counter = 0;
 
             // state.RK, state.CKr = KDF_RK(state.RK, DH(state.DHs, state.DHr))
             (self.root_key, self.chain_key_receiving) = kdf_root_key(
@@ -159,12 +186,57 @@ impl RatchetState {
             );
         }
 
-        // state.CKr, mk = KDF_CK(state.CKr)
+        if message.header.counter < self.receiving_counter {
+            return Err(anyhow!("stale message counter"));
+        }
+
+        let gap = message.header.counter - self.receiving_counter;
+        if gap > MAX_SKIPPED_MESSAGES {
+            return Err(anyhow!("message gap too large"));
+        }
+
+        while self.receiving_counter < message.header.counter {
+            let (chain_key_receiving, message_key) = kdf_chain_key(&self.chain_key_receiving);
+            self.chain_key_receiving = chain_key_receiving;
+            self.store_skipped_key(self.receiving_counter, message_key)?;
+            self.receiving_counter += 1;
+        }
+
         let (chain_key_receiving, message_key) = kdf_chain_key(&self.chain_key_receiving);
         self.chain_key_receiving = chain_key_receiving;
+        self.receiving_counter += 1;
 
-        //  DECRYPT(mk, ciphertext, CONCAT(AD, header))
-        let mut cipher = ChaCha20Poly1305::new(&message_key.try_into()?);
+        let message_plaintext =
+            self.decrypt_message(&message, aditionnal_data, &message_key)?;
+
+        Ok(message_plaintext)
+    }
+
+    fn store_skipped_key(&mut self, counter: u64, message_key: [u8; 32]) -> Result<()> {
+        if self.skipped_message_keys.len() >= MAX_SKIPPED_KEYS {
+            return Err(anyhow!("too many skipped message keys"));
+        }
+        let Some(pk) = self.receiving_pk else {
+            return Err(anyhow!("missing receiving public key"));
+        };
+        self.skipped_message_keys
+            .insert(SkippedKeyId::new(&pk, counter), message_key);
+        Ok(())
+    }
+
+    fn take_skipped_key(&mut self, pk: &ecdh::PublicKey, counter: u64) -> Option<[u8; 32]> {
+        self.skipped_message_keys
+            .remove(&SkippedKeyId::new(pk, counter))
+    }
+
+    fn decrypt_message(
+        &self,
+        message: &RatchetMessage,
+        aditionnal_data: &[u8],
+        message_key: &[u8; 32],
+    ) -> Result<String> {
+        let mut cipher = ChaCha20Poly1305::new_from_slice(message_key)
+            .map_err(|e| anyhow!("failed to init cipher: {}", e))?;
         let aad = header_aad(aditionnal_data, &message.header);
         let plaintext = cipher
             .decrypt(
@@ -175,11 +247,7 @@ impl RatchetState {
                 },
             )
             .map_err(|e| anyhow!("failed to decrypt message: {}", e.to_string()))?;
-
-        let message_plaintext = String::from_utf8(plaintext)?;
-        self.receiving_counter += 1;
-
-        Ok(message_plaintext)
+        Ok(String::from_utf8(plaintext)?)
     }
 }
 

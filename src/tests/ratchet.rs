@@ -73,3 +73,21 @@ fn ratchet_rejects_message_with_tampered_counter() {
     message.header.counter += 1;
     assert!(bob.receive_message(message, ad).is_err());
 }
+
+#[test]
+fn ratchet_handles_out_of_order_messages() {
+    let shared_key: [u8; 32] = rand::random();
+    let mut bob = RatchetState::as_receiver(shared_key);
+    let bob_pk = ecdh::PublicKey::from(&bob.sending_sk);
+    let mut alice = RatchetState::as_initiator(shared_key, bob_pk);
+
+    let ad = b"ratchet-ad";
+    let first = alice.send_message("one", ad).unwrap();
+    let second = alice.send_message("two", ad).unwrap();
+
+    let second_plain = bob.receive_message(second, ad).unwrap();
+    assert_eq!(second_plain, "two");
+
+    let first_plain = bob.receive_message(first, ad).unwrap();
+    assert_eq!(first_plain, "one");
+}

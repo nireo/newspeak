@@ -876,6 +876,7 @@ fn ratchet_state_from_bytes(bytes: &[u8]) -> Result<RatchetState> {
         root_key,
         chain_key_sending,
         chain_key_receiving,
+        skipped_message_keys: std::collections::HashMap::new(),
     })
 }
 
