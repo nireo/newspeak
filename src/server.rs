@@ -1,9 +1,9 @@
-use dashmap::DashMap;
-use ed25519_dalek::{VerifyingKey, ed25519};
 use crate::newspeak::newspeak_server::{Newspeak, NewspeakServer};
 use crate::newspeak::{
     self, FetchPrekeyBundleRequest, FetchPrekeyBundleResponse, RegisterRequest, RegisterResponse,
 };
+use dashmap::DashMap;
+use ed25519_dalek::{VerifyingKey, ed25519};
 use prost::Message;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::collections::HashMap;
@@ -103,6 +103,32 @@ fn identity_pk_from_user(user: &ServerUser) -> Result<VerifyingKey, Status> {
         .map_err(|_| Status::internal("stored identity key is invalid, database corrupted"))
 }
 
+fn verify_signed_prekey(
+    identity_pk: &VerifyingKey,
+    prekey: &newspeak::SignedPrekey,
+    expected_kind: newspeak::KeyKind,
+) -> Result<(), Status> {
+    let kind = newspeak::KeyKind::try_from(prekey.kind)
+        .map_err(|_| Status::invalid_argument("invalid key kind"))?;
+    if kind != expected_kind {
+        return Err(Status::invalid_argument(
+            "unexpected key kind in signed prekey",
+        ));
+    }
+    let signature_bytes: [u8; 64] = prekey
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| Status::invalid_argument("invalid signature length in signed prekey"))?;
+    identity_pk
+        .verify_strict(
+            &prekey.key,
+            &ed25519_dalek::Signature::from_bytes(&signature_bytes),
+        )
+        .map_err(|_| Status::invalid_argument("signed prekey signature verification failed"))?;
+    Ok(())
+}
+
 // implement conversion from client message to offline message kind with a try from
 impl TryFrom<&ClientMessage> for OfflineMessageKind {
     type Error = Status;
@@ -167,9 +193,7 @@ impl NewspeakService {
                 },
             ),
             _ => {
-                return Err(Status::invalid_argument(
-                    "unsupported offline message type",
-                ));
+                return Err(Status::invalid_argument("unsupported offline message type"));
             }
         };
 
@@ -439,7 +463,6 @@ impl NewspeakService {
     }
 }
 
-
 #[tonic::async_trait]
 impl Newspeak for NewspeakService {
     type MessageStreamStream = ReceiverStream<Result<ServerMessage, Status>>;
@@ -523,25 +546,19 @@ impl Newspeak for NewspeakService {
         for key in request.keys {
             let kind = newspeak::KeyKind::try_from(key.kind)
                 .map_err(|_| Status::invalid_argument("invalid key kind"))?;
-            let signature_bytes: [u8; 64] = key.signature.as_slice().try_into().map_err(|_| {
-                Status::invalid_argument("invalid signature length in signed prekey")
-            })?;
-
-            identity_pk
-                .verify_strict(
-                    &key.key,
-                    &ed25519_dalek::Signature::from_bytes(&signature_bytes),
-                )
-                .map_err(|_| {
-                    Status::invalid_argument("signed prekey signature verification failed")
-                })?;
 
             match kind {
-                newspeak::KeyKind::X25519 => x25519_keys.push(StoredPrekey {
-                    id: i64::from(key.id),
-                    prekey: key,
-                }),
-                newspeak::KeyKind::MlKem1024 => kem_keys.push(key),
+                newspeak::KeyKind::X25519 => {
+                    verify_signed_prekey(&identity_pk, &key, newspeak::KeyKind::X25519)?;
+                    x25519_keys.push(StoredPrekey {
+                        id: i64::from(key.id),
+                        prekey: key,
+                    });
+                }
+                newspeak::KeyKind::MlKem1024 => {
+                    verify_signed_prekey(&identity_pk, &key, newspeak::KeyKind::MlKem1024)?;
+                    kem_keys.push(key);
+                }
             }
         }
 
@@ -583,14 +600,28 @@ impl Newspeak for NewspeakService {
                 .ok_or_else(|| Status::invalid_argument("kem_prekey is required"))?;
 
             let identity_key = request.identity_key;
+            let identity_key_bytes: [u8; 32] = identity_key
+                .as_slice()
+                .try_into()
+                .map_err(|_| Status::invalid_argument("invalid identity key length"))?;
+            let identity_pk = VerifyingKey::from_bytes(&identity_key_bytes)
+                .map_err(|_| Status::invalid_argument("invalid identity key"))?;
+
+            // validate all of the keys just in case
+            verify_signed_prekey(&identity_pk, &signed_prekey, newspeak::KeyKind::X25519)?;
+            verify_signed_prekey(&identity_pk, &kem_prekey, newspeak::KeyKind::MlKem1024)?;
+
             let one_time_prekeys = request
                 .one_time_prekeys
                 .into_iter()
-                .map(|prekey| StoredPrekey {
-                    id: i64::from(prekey.id),
-                    prekey,
+                .map(|prekey| {
+                    verify_signed_prekey(&identity_pk, &prekey, newspeak::KeyKind::X25519)?;
+                    Ok(StoredPrekey {
+                        id: i64::from(prekey.id),
+                        prekey,
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, Status>>()?;
 
             let server_user = ServerUser {
                 id: None,

@@ -21,6 +21,16 @@ fn sample_prekey_with_id(kind: KeyKind, key: &[u8], signature: &[u8], id: u32) -
     }
 }
 
+fn signed_prekey(signing_key: &SigningKey, kind: KeyKind, key: &[u8], id: u32) -> SignedPrekey {
+    let signature = signing_key.sign(key);
+    SignedPrekey {
+        kind: kind as i32,
+        key: key.to_vec(),
+        signature: signature.to_bytes().to_vec(),
+        id,
+    }
+}
+
 async fn test_service() -> NewspeakService {
     let db = SqlitePoolOptions::new()
         .max_connections(1)
@@ -38,12 +48,13 @@ async fn test_service() -> NewspeakService {
 #[tokio::test]
 async fn register_persists_keys() {
     let svc = test_service().await;
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
     let request = RegisterRequest {
         username: "alice".to_string(),
-        identity_key: vec![1, 2, 3],
-        signed_prekey: Some(sample_prekey(KeyKind::X25519, &[4, 5], &[6])),
-        one_time_prekeys: vec![sample_prekey_with_id(KeyKind::X25519, &[7], &[8], 1)],
-        kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[9], &[10])),
+        identity_key: signing_key.verifying_key().to_bytes().to_vec(),
+        signed_prekey: Some(signed_prekey(&signing_key, KeyKind::X25519, &[4, 5], 0)),
+        one_time_prekeys: vec![signed_prekey(&signing_key, KeyKind::X25519, &[7], 1)],
+        kem_prekey: Some(signed_prekey(&signing_key, KeyKind::MlKem1024, &[9], 0)),
     };
 
     let response = svc.register(Request::new(request)).await.unwrap();
@@ -56,12 +67,13 @@ async fn register_persists_keys() {
 #[tokio::test]
 async fn register_is_idempotent_for_existing_username() {
     let svc = test_service().await;
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
     let request = RegisterRequest {
         username: "bob".to_string(),
-        identity_key: vec![11, 12],
-        signed_prekey: Some(sample_prekey(KeyKind::X25519, &[13], &[14])),
+        identity_key: signing_key.verifying_key().to_bytes().to_vec(),
+        signed_prekey: Some(signed_prekey(&signing_key, KeyKind::X25519, &[13], 0)),
         one_time_prekeys: vec![],
-        kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[15], &[16])),
+        kem_prekey: Some(signed_prekey(&signing_key, KeyKind::MlKem1024, &[15], 0)),
     };
 
     svc.register(Request::new(request.clone())).await.unwrap();
@@ -72,12 +84,13 @@ async fn register_is_idempotent_for_existing_username() {
 #[tokio::test]
 async fn fetch_prekey_bundle_returns_and_consumes_keys() {
     let svc = test_service().await;
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
     let request = RegisterRequest {
         username: "carol".to_string(),
-        identity_key: vec![1],
-        signed_prekey: Some(sample_prekey(KeyKind::X25519, &[2], &[3])),
-        one_time_prekeys: vec![sample_prekey_with_id(KeyKind::X25519, &[4], &[5], 7)],
-        kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[6], &[7])),
+        identity_key: signing_key.verifying_key().to_bytes().to_vec(),
+        signed_prekey: Some(signed_prekey(&signing_key, KeyKind::X25519, &[2], 0)),
+        one_time_prekeys: vec![signed_prekey(&signing_key, KeyKind::X25519, &[4], 7)],
+        kem_prekey: Some(signed_prekey(&signing_key, KeyKind::MlKem1024, &[6], 0)),
     };
 
     svc.register(Request::new(request)).await.unwrap();
@@ -102,7 +115,10 @@ async fn fetch_prekey_bundle_returns_and_consumes_keys() {
         .unwrap();
 
     let bundle = response.into_inner().bundle.unwrap();
-    assert_eq!(bundle.identity_key, vec![1]);
+    assert_eq!(
+        bundle.identity_key,
+        signing_key.verifying_key().to_bytes().to_vec()
+    );
     assert_eq!(bundle.signed_prekey.unwrap().key, vec![2]);
     assert_eq!(bundle.kem_encap_key.unwrap().key, vec![8]);
     assert_eq!(bundle.one_time_prekey.unwrap().key, vec![4]);
@@ -117,27 +133,34 @@ async fn one_time_prekey_ids_are_scoped_per_user() {
     let svc = test_service().await;
     let alice_id = 42u32;
     let bob_id = 42u32;
+    let alice_signing_key = SigningKey::generate(&mut rand::thread_rng());
+    let bob_signing_key = SigningKey::generate(&mut rand::thread_rng());
 
     let alice_request = RegisterRequest {
         username: "alice".to_string(),
-        identity_key: vec![10],
-        signed_prekey: Some(sample_prekey(KeyKind::X25519, &[11], &[12])),
-        one_time_prekeys: vec![sample_prekey_with_id(
+        identity_key: alice_signing_key.verifying_key().to_bytes().to_vec(),
+        signed_prekey: Some(signed_prekey(&alice_signing_key, KeyKind::X25519, &[11], 0)),
+        one_time_prekeys: vec![signed_prekey(
+            &alice_signing_key,
             KeyKind::X25519,
             &[13],
-            &[14],
             alice_id,
         )],
-        kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[15], &[16])),
+        kem_prekey: Some(signed_prekey(
+            &alice_signing_key,
+            KeyKind::MlKem1024,
+            &[15],
+            0,
+        )),
     };
     svc.register(Request::new(alice_request)).await.unwrap();
 
     let bob_request = RegisterRequest {
         username: "bob".to_string(),
-        identity_key: vec![20],
-        signed_prekey: Some(sample_prekey(KeyKind::X25519, &[21], &[22])),
-        one_time_prekeys: vec![sample_prekey_with_id(KeyKind::X25519, &[23], &[24], bob_id)],
-        kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[25], &[26])),
+        identity_key: bob_signing_key.verifying_key().to_bytes().to_vec(),
+        signed_prekey: Some(signed_prekey(&bob_signing_key, KeyKind::X25519, &[21], 0)),
+        one_time_prekeys: vec![signed_prekey(&bob_signing_key, KeyKind::X25519, &[23], bob_id)],
+        kem_prekey: Some(signed_prekey(&bob_signing_key, KeyKind::MlKem1024, &[25], 0)),
     };
     svc.register(Request::new(bob_request)).await.unwrap();
 
@@ -169,12 +192,13 @@ async fn one_time_prekey_ids_are_scoped_per_user() {
 #[tokio::test]
 async fn add_one_time_prekeys_ignores_duplicates() {
     let svc = test_service().await;
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
     let request = RegisterRequest {
         username: "dana".to_string(),
-        identity_key: vec![1],
-        signed_prekey: Some(sample_prekey(KeyKind::X25519, &[2], &[3])),
-        one_time_prekeys: vec![sample_prekey_with_id(KeyKind::X25519, &[4], &[5], 1)],
-        kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[6], &[7])),
+        identity_key: signing_key.verifying_key().to_bytes().to_vec(),
+        signed_prekey: Some(signed_prekey(&signing_key, KeyKind::X25519, &[2], 0)),
+        one_time_prekeys: vec![signed_prekey(&signing_key, KeyKind::X25519, &[4], 1)],
+        kem_prekey: Some(signed_prekey(&signing_key, KeyKind::MlKem1024, &[6], 0)),
     };
 
     svc.register(Request::new(request)).await.unwrap();
@@ -214,9 +238,9 @@ async fn auth_challenge_verifies_and_is_single_use() {
     let request = RegisterRequest {
         username: "dave".to_string(),
         identity_key: signing_key.verifying_key().to_bytes().to_vec(),
-        signed_prekey: Some(sample_prekey(KeyKind::X25519, &[1], &[2])),
+        signed_prekey: Some(signed_prekey(&signing_key, KeyKind::X25519, &[1], 0)),
         one_time_prekeys: vec![],
-        kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[3], &[4])),
+        kem_prekey: Some(signed_prekey(&signing_key, KeyKind::MlKem1024, &[3], 0)),
     };
 
     let response = svc.register(Request::new(request)).await.unwrap();
@@ -246,9 +270,9 @@ async fn auth_challenge_expires() {
     let request = RegisterRequest {
         username: "erin".to_string(),
         identity_key: signing_key.verifying_key().to_bytes().to_vec(),
-        signed_prekey: Some(sample_prekey(KeyKind::X25519, &[5], &[6])),
+        signed_prekey: Some(signed_prekey(&signing_key, KeyKind::X25519, &[5], 0)),
         one_time_prekeys: vec![],
-        kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[7], &[8])),
+        kem_prekey: Some(signed_prekey(&signing_key, KeyKind::MlKem1024, &[7], 0)),
     };
 
     let response = svc.register(Request::new(request)).await.unwrap();
@@ -285,9 +309,9 @@ async fn auth_challenge_cleanup_runs_in_background() {
     let request = RegisterRequest {
         username: "frank".to_string(),
         identity_key: signing_key.verifying_key().to_bytes().to_vec(),
-        signed_prekey: Some(sample_prekey(KeyKind::X25519, &[9], &[10])),
+        signed_prekey: Some(signed_prekey(&signing_key, KeyKind::X25519, &[9], 0)),
         one_time_prekeys: vec![],
-        kem_prekey: Some(sample_prekey(KeyKind::MlKem1024, &[11], &[12])),
+        kem_prekey: Some(signed_prekey(&signing_key, KeyKind::MlKem1024, &[11], 0)),
     };
 
     svc.register(Request::new(request)).await.unwrap();
