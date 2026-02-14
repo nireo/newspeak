@@ -24,6 +24,14 @@ $ cargo run --bin server
 
 The client is responsible for the cryptography. Client creates a shared secret with the local keys combined with the prekey bundle received from the server. Once the initiator is finished with the key generation, they send a key exchange message to the server that the server sends to the receiver. The message contains everything to create the shared secret. The shared secret is then fed into the double ratchet implementation which continuously updates keys between messages to keep the process secure even if keys are compromised. Please check Signal's website for information about both [PQXDH](https://signal.org/docs/specifications/pqxdh/) and [Double Ratchet](https://signal.org/docs/specifications/doubleratchet/).
 
+Run a client with:
+
+```sh
+cargo run --bin client -- alice
+```
+
+You can provide an optional second username to open that conversation immediately.
+
 ## Quick test session
 
 Use the helper script to reset databases, start the server, and open two client instances:
