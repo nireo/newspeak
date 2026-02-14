@@ -79,8 +79,7 @@ fn pqxdh_rejects_invalid_ml_kem_prekey_signature() {
 
     let mut rng = rand::thread_rng();
     let mut fake_signer = ed25519::SigningKey::generate(&mut rng);
-    bob_bundle.kem_prekey.signature =
-        fake_signer.sign(&bob_bundle.kem_prekey.encap_key.as_bytes());
+    bob_bundle.kem_prekey.signature = fake_signer.sign(&bob_bundle.kem_prekey.encap_key.as_bytes());
 
     assert!(alice.init_key_exchange(&bob_bundle).is_err());
 }

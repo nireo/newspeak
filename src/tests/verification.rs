@@ -21,7 +21,5 @@ fn safety_number_format_is_numeric_groups() {
 
     assert_eq!(groups.len(), SAFETY_NUMBER_GROUPS);
     assert!(groups.iter().all(|group| group.len() == 5));
-    assert!(safety
-        .chars()
-        .all(|ch| ch.is_ascii_digit() || ch == ' '));
+    assert!(safety.chars().all(|ch| ch.is_ascii_digit() || ch == ' '));
 }

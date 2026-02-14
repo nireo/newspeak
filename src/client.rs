@@ -32,12 +32,12 @@ type StdinLines = tokio::io::Lines<BufReader<io::Stdin>>;
 /// ActiveConversation represents a conversation with some receiver and its associated ratchet
 /// state.
 struct ActiveConversation {
-    receiver: String,
+    receiver: Option<String>,
     ratchet_state: Option<RatchetState>,
 }
 
 impl ActiveConversation {
-    fn new(receiver: String, ratchet_state: Option<RatchetState>) -> Self {
+    fn new(receiver: Option<String>, ratchet_state: Option<RatchetState>) -> Self {
         Self {
             receiver,
             ratchet_state,
@@ -567,7 +567,7 @@ async fn handle_key_exchange_message(
 
     let is_current = {
         let guard = active_conversation.lock().await;
-        guard.receiver == message.sender_id
+        guard.receiver.as_deref() == Some(message.sender_id.as_str())
     };
     if is_current {
         let mut guard = active_conversation.lock().await;
@@ -604,7 +604,7 @@ async fn handle_encrypted_message(
     };
     let is_current = {
         let guard = active_conversation.lock().await;
-        guard.receiver == sender_id
+        guard.receiver.as_deref() == Some(sender_id.as_str())
     };
     if is_current {
         let mut guard = active_conversation.lock().await;
@@ -728,43 +728,10 @@ mod tests {
     }
 }
 
-async fn choose_conversation(username: &str, store: &LocalStorage) -> anyhow::Result<String> {
-    let conversations = store.get_user_conversations(username).await?;
-
-    let stdin = io::stdin();
-    let mut reader = BufReader::new(stdin);
-
-    if conversations.is_empty() {
-        println!("no conversations found, please enter a username to start a new conversation:");
-        let mut input = String::new();
-
-        reader.read_line(&mut input).await?;
-        Ok(input.trim().to_string())
-    } else {
-        println!("existing conversations:");
-        for (i, convo) in conversations.iter().enumerate() {
-            println!("  {}: {}", i + 1, convo);
-        }
-        println!("enter the number of the conversation to continue, or enter a new username:");
-
-        let mut input = String::new();
-        reader.read_line(&mut input).await?;
-        let input = input.trim();
-
-        if let Ok(index) = input.parse::<usize>() {
-            if index > 0 && index <= conversations.len() {
-                return Ok(conversations[index - 1].clone());
-            }
-        }
-
-        Ok(input.to_string())
-    }
-}
-
 fn parse_args() -> Result<(String, Option<String>)> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        return Err(anyhow!("usage: newspeak <you> <optional username>"));
+        return Err(anyhow!("usage: newspeak <you> [optional username]"));
     }
 
     Ok((args[1].clone(), args.get(2).cloned()))
@@ -774,19 +741,6 @@ fn stdin_lines() -> StdinLines {
     let stdin = io::stdin();
     let reader = BufReader::new(stdin);
     reader.lines()
-}
-
-/// select_receiver selects the conversation receiver based on the provided argument or by
-/// prompting the user to choose from existing conversations.
-async fn select_receiver(
-    username: &str,
-    receiver_arg: Option<String>,
-    storage: &LocalStorage,
-) -> Result<String> {
-    match receiver_arg {
-        Some(receiver) => Ok(receiver),
-        None => choose_conversation(username, storage).await,
-    }
 }
 
 /// setup_message_stream sets up the gRPC message stream with the server for the given user.
@@ -858,14 +812,25 @@ async fn prompt_switch_conversation(
         guard.receiver.clone()
     };
     let mut conversations = storage.get_user_conversations(username).await?;
-    if !conversations.iter().any(|name| name == &current) {
-        conversations.push(current.clone());
+    if let Some(current) = current.as_ref() {
+        if !conversations.iter().any(|name| name == current) {
+            conversations.push(current.clone());
+        }
     }
     conversations.sort();
 
+    if conversations.is_empty() {
+        print_incoming(&format_chat_line(
+            now_unix_seconds(),
+            "system",
+            "no conversations yet; use /init <username>",
+        ));
+        return Ok(());
+    }
+
     println!("available conversations:");
     for convo in &conversations {
-        if convo == &current {
+        if current.as_deref() == Some(convo.as_str()) {
             println!("  {} (current)", convo);
         } else {
             println!("  {}", convo);
@@ -877,7 +842,7 @@ async fn prompt_switch_conversation(
         return Ok(());
     };
     let choice = input.trim();
-    if choice.is_empty() || choice == current {
+    if choice.is_empty() || current.as_deref() == Some(choice) {
         print_incoming(&format_chat_line(
             now_unix_seconds(),
             "system",
@@ -906,8 +871,8 @@ async fn prompt_switch_conversation(
 
     {
         let mut guard = active_conversation.lock().await;
-        guard.receiver = choice.to_string();
-        guard.ratchet_state = None;
+        guard.receiver = Some(choice.to_string());
+        guard.ratchet_state = stored_conversation;
     }
 
     print_incoming(&format_chat_line(
@@ -1053,12 +1018,7 @@ async fn initiate_key_exchange_if_needed(
     active_conversation: &Arc<Mutex<ActiveConversation>>,
     storage: &LocalStorage,
     tx: &mpsc::Sender<ClientMessage>,
-    has_conversation: bool,
 ) -> Result<()> {
-    if has_conversation {
-        return Ok(());
-    }
-
     {
         let guard = active_conversation.lock().await;
         if guard.ratchet_state.is_some() {
@@ -1117,6 +1077,7 @@ async fn initiate_key_exchange_if_needed(
 /// commands, and sending messages.
 async fn run_input_loop(
     lines: &mut StdinLines,
+    user: &mut User<'_>,
     username: &str,
     active_conversation: &Arc<Mutex<ActiveConversation>>,
     storage: &LocalStorage,
@@ -1145,12 +1106,86 @@ async fn run_input_loop(
             continue;
         }
 
+        let mut command_parts = trimmed.split_whitespace();
+        if command_parts.next() == Some("/init") {
+            let Some(receiver) = command_parts.next() else {
+                print_incoming(&format_chat_line(
+                    now_unix_seconds(),
+                    "system",
+                    "usage: /init <username>",
+                ));
+                continue;
+            };
+            if receiver == username {
+                print_incoming(&format_chat_line(
+                    now_unix_seconds(),
+                    "system",
+                    "cannot start a conversation with yourself",
+                ));
+                continue;
+            }
+
+            let stored_conversation =
+                match load_conversation_history(storage, username, receiver).await {
+                    Ok(state) => state,
+                    Err(err) => {
+                        print_incoming(&format_chat_line(
+                            now_unix_seconds(),
+                            "system",
+                            &format!("failed to load conversation: {}", err),
+                        ));
+                        continue;
+                    }
+                };
+
+            {
+                let mut guard = active_conversation.lock().await;
+                guard.receiver = Some(receiver.to_string());
+                guard.ratchet_state = stored_conversation;
+            }
+
+            print_incoming(&format_chat_line(
+                now_unix_seconds(),
+                "system",
+                &format!("active conversation set to {}", receiver),
+            ));
+
+            if let Err(err) = initiate_key_exchange_if_needed(
+                user,
+                username,
+                receiver,
+                active_conversation,
+                storage,
+                tx,
+            )
+            .await
+            {
+                print_incoming(&format_chat_line(
+                    now_unix_seconds(),
+                    "system",
+                    &format!("init failed: {}", err),
+                ));
+            }
+            continue;
+        }
+
         if trimmed == "/verify" {
             let receiver = {
                 let guard = active_conversation.lock().await;
                 guard.receiver.clone()
             };
-            match storage.mark_peer_identity_verified(username, &receiver).await {
+            let Some(receiver) = receiver else {
+                print_incoming(&format_chat_line(
+                    now_unix_seconds(),
+                    "system",
+                    "no active conversation; use /init <username> first",
+                ));
+                continue;
+            };
+            match storage
+                .mark_peer_identity_verified(username, &receiver)
+                .await
+            {
                 Ok(true) => {
                     print_incoming(&format_chat_line(
                         now_unix_seconds(),
@@ -1178,7 +1213,14 @@ async fn run_input_loop(
 
         let timestamp = now_unix_seconds();
         let mut guard = active_conversation.lock().await;
-        let receiver = guard.receiver.clone();
+        let Some(receiver) = guard.receiver.clone() else {
+            print_incoming(&format_chat_line(
+                timestamp,
+                "system",
+                "no active conversation; use /init <username> or /switch",
+            ));
+            continue;
+        };
         if guard.ratchet_state.is_none() {
             match storage.get_conversation(username, &receiver).await {
                 Ok(Some(state)) => {
@@ -1265,7 +1307,7 @@ pub async fn run() -> Result<()> {
     let storage = LocalStorage::new(&username).await?;
     let key_info = storage.load_or_create_user(&username).await?;
     let mut user = User::new(&username, client, key_info);
-    let receiver = select_receiver(&username, receiver_arg, &storage).await?;
+    let initial_receiver = receiver_arg.filter(|receiver| !receiver.trim().is_empty());
 
     println!("logged in as: {}", user.username);
 
@@ -1278,13 +1320,22 @@ pub async fn run() -> Result<()> {
     send_join_request(&user, &tx).await?;
 
     clear_terminal();
-    let stored_conversation = load_conversation_history(&storage, &username, &receiver).await?;
-    let found_conversation = stored_conversation.is_some();
+    let stored_conversation = match initial_receiver.as_deref() {
+        Some(receiver) => load_conversation_history(&storage, &username, receiver).await?,
+        None => None,
+    };
 
     let active_conversation = Arc::new(Mutex::new(ActiveConversation::new(
-        receiver.clone(),
+        initial_receiver.clone(),
         stored_conversation,
     )));
+    if initial_receiver.is_none() {
+        print_incoming(&format_chat_line(
+            now_unix_seconds(),
+            "system",
+            "no active conversation; use /init <username>",
+        ));
+    }
     let (joined_tx, joined_rx) = oneshot::channel();
     spawn_inbound_task(
         inbound,
@@ -1296,22 +1347,36 @@ pub async fn run() -> Result<()> {
         Some(joined_tx),
     );
 
-    if !found_conversation {
-        let _ = joined_rx.await;
+    let _ = joined_rx.await;
+
+    // if a receiver was provided on startup, try to initialize it immediately
+    if let Some(receiver) = initial_receiver.as_deref() {
+        if let Err(err) = initiate_key_exchange_if_needed(
+            &mut user,
+            &username,
+            receiver,
+            &active_conversation,
+            &storage,
+            &tx,
+        )
+        .await
+        {
+            print_incoming(&format_chat_line(
+                now_unix_seconds(),
+                "system",
+                &format!("init failed: {}", err),
+            ));
+        }
     }
 
-    // ensure that a key exchange is initiated if there is no existing conversation state
-    initiate_key_exchange_if_needed(
+    run_input_loop(
+        &mut lines,
         &mut user,
         &username,
-        &receiver,
         &active_conversation,
         &storage,
         &tx,
-        found_conversation,
     )
     .await?;
-
-    run_input_loop(&mut lines, &username, &active_conversation, &storage, &tx).await?;
     Ok(())
 }

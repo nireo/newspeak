@@ -1,6 +1,6 @@
 use super::*;
-use ed25519_dalek::{Signer, SigningKey};
 use crate::newspeak::{KeyKind, SignedPrekey};
+use ed25519_dalek::{Signer, SigningKey};
 use tonic::Code;
 
 fn sample_prekey(kind: KeyKind, key: &[u8], signature: &[u8]) -> SignedPrekey {
@@ -159,8 +159,18 @@ async fn one_time_prekey_ids_are_scoped_per_user() {
         username: "bob".to_string(),
         identity_key: bob_signing_key.verifying_key().to_bytes().to_vec(),
         signed_prekey: Some(signed_prekey(&bob_signing_key, KeyKind::X25519, &[21], 0)),
-        one_time_prekeys: vec![signed_prekey(&bob_signing_key, KeyKind::X25519, &[23], bob_id)],
-        kem_prekey: Some(signed_prekey(&bob_signing_key, KeyKind::MlKem1024, &[25], 0)),
+        one_time_prekeys: vec![signed_prekey(
+            &bob_signing_key,
+            KeyKind::X25519,
+            &[23],
+            bob_id,
+        )],
+        kem_prekey: Some(signed_prekey(
+            &bob_signing_key,
+            KeyKind::MlKem1024,
+            &[25],
+            0,
+        )),
     };
     svc.register(Request::new(bob_request)).await.unwrap();
 
@@ -202,11 +212,7 @@ async fn add_one_time_prekeys_ignores_duplicates() {
     };
 
     svc.register(Request::new(request)).await.unwrap();
-    let user = svc
-        .server_store
-        .get_user("dana".to_string())
-        .await
-        .unwrap();
+    let user = svc.server_store.get_user("dana".to_string()).await.unwrap();
     let user_id = user.id.unwrap();
 
     let prekeys = vec![
@@ -284,8 +290,7 @@ async fn auth_challenge_expires() {
         guard.insert(
             "erin".to_string(),
             AuthChallenge {
-                created_at: challenge.created_at
-                    - (AUTH_CHALLENGE_TTL + Duration::from_secs(1)),
+                created_at: challenge.created_at - (AUTH_CHALLENGE_TTL + Duration::from_secs(1)),
                 data: challenge.data,
             },
         );
@@ -322,8 +327,7 @@ async fn auth_challenge_cleanup_runs_in_background() {
         guard.insert(
             "frank".to_string(),
             AuthChallenge {
-                created_at: challenge.created_at
-                    - (AUTH_CHALLENGE_TTL + Duration::from_secs(1)),
+                created_at: challenge.created_at - (AUTH_CHALLENGE_TTL + Duration::from_secs(1)),
                 data: challenge.data,
             },
         );
@@ -344,13 +348,7 @@ async fn offline_messages_are_scoped_to_receiver() {
     let svc = test_service().await;
 
     svc.server_store
-        .insert_message(
-            OfflineMessageKind::Regular,
-            b"hello",
-            "alice",
-            "bob",
-            1,
-        )
+        .insert_message(OfflineMessageKind::Regular, b"hello", "alice", "bob", 1)
         .await
         .unwrap();
     svc.server_store
@@ -364,13 +362,7 @@ async fn offline_messages_are_scoped_to_receiver() {
         .await
         .unwrap();
     svc.server_store
-        .insert_message(
-            OfflineMessageKind::Regular,
-            b"private",
-            "alice",
-            "dave",
-            3,
-        )
+        .insert_message(OfflineMessageKind::Regular, b"private", "alice", "dave", 3)
         .await
         .unwrap();
 
@@ -383,7 +375,10 @@ async fn offline_messages_are_scoped_to_receiver() {
         .map(|stored| stored.message)
         .collect();
     bob_messages.sort();
-    assert_eq!(bob_messages, vec![b"hello".to_vec(), b"key-exchange".to_vec()]);
+    assert_eq!(
+        bob_messages,
+        vec![b"hello".to_vec(), b"key-exchange".to_vec()]
+    );
 
     let dave_messages = svc.server_store.get_offline_messages("dave").await.unwrap();
     assert_eq!(dave_messages.len(), 1);
@@ -402,23 +397,11 @@ async fn delete_offline_messages_respects_timestamp() {
     let svc = test_service().await;
 
     svc.server_store
-        .insert_message(
-            OfflineMessageKind::Regular,
-            b"old",
-            "alice",
-            "bob",
-            1,
-        )
+        .insert_message(OfflineMessageKind::Regular, b"old", "alice", "bob", 1)
         .await
         .unwrap();
     svc.server_store
-        .insert_message(
-            OfflineMessageKind::Regular,
-            b"new",
-            "alice",
-            "bob",
-            2,
-        )
+        .insert_message(OfflineMessageKind::Regular, b"new", "alice", "bob", 2)
         .await
         .unwrap();
 

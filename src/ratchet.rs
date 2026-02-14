@@ -206,8 +206,7 @@ impl RatchetState {
         self.chain_key_receiving = chain_key_receiving;
         self.receiving_counter += 1;
 
-        let message_plaintext =
-            self.decrypt_message(&message, aditionnal_data, &message_key)?;
+        let message_plaintext = self.decrypt_message(&message, aditionnal_data, &message_key)?;
 
         Ok(message_plaintext)
     }

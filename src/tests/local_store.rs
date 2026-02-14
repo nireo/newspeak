@@ -254,7 +254,10 @@ async fn peer_identity_roundtrip_and_verify() -> Result<()> {
         .await?;
     assert!(matches!(inserted, PeerIdentityStoreResult::Inserted));
 
-    let stored = storage.get_peer_identity("alice", "bob").await?.expect("identity");
+    let stored = storage
+        .get_peer_identity("alice", "bob")
+        .await?
+        .expect("identity");
     assert_eq!(stored.identity_key, identity_a);
     assert!(!stored.verified);
 
@@ -269,14 +272,18 @@ async fn peer_identity_roundtrip_and_verify() -> Result<()> {
     let mismatched = storage
         .store_peer_identity("alice", "bob", &identity_b)
         .await?;
-    assert!(matches!(mismatched, PeerIdentityStoreResult::ExistingMismatch));
+    assert!(matches!(
+        mismatched,
+        PeerIdentityStoreResult::ExistingMismatch
+    ));
 
-    let updated = storage
-        .mark_peer_identity_verified("alice", "bob")
-        .await?;
+    let updated = storage.mark_peer_identity_verified("alice", "bob").await?;
     assert!(updated);
 
-    let stored = storage.get_peer_identity("alice", "bob").await?.expect("identity");
+    let stored = storage
+        .get_peer_identity("alice", "bob")
+        .await?
+        .expect("identity");
     assert!(stored.verified);
 
     Ok(())

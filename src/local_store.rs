@@ -106,11 +106,7 @@ impl LocalStorage {
         let mut tx = self.db.begin().await?;
         for (id, key_bytes, used) in rows {
             let query = sqlx::query(&sql);
-            let query = id
-                .bind(query)
-                .bind(&username)
-                .bind(&key_bytes)
-                .bind(used);
+            let query = id.bind(query).bind(&username).bind(&key_bytes).bind(used);
             query.execute(&mut *tx).await?;
         }
         tx.commit().await?;
@@ -301,7 +297,8 @@ impl LocalStorage {
             .into_iter()
             .map(|(id, key_bytes, used)| (LocalKeyId::Int(i64::from(id)), key_bytes, used))
             .collect();
-        self.insert_key_rows(username, rows, LocalKeyTable::Ec).await
+        self.insert_key_rows(username, rows, LocalKeyTable::Ec)
+            .await
     }
 
     pub async fn get_user_kem_keys(
@@ -397,12 +394,8 @@ impl LocalStorage {
     }
 
     pub async fn mark_kem_key_used(&self, username: &str, id: &KemId) -> Result<()> {
-        self.mark_key_used(
-            username,
-            LocalKeyId::Blob(id.to_vec()),
-            LocalKeyTable::Kem,
-        )
-        .await
+        self.mark_key_used(username, LocalKeyId::Blob(id.to_vec()), LocalKeyTable::Kem)
+            .await
     }
 
     pub async fn get_conversation(
@@ -631,11 +624,7 @@ impl LocalStorage {
         Ok(PeerIdentityStoreResult::Inserted)
     }
 
-    pub async fn mark_peer_identity_verified(
-        &self,
-        username: &str,
-        peer: &str,
-    ) -> Result<bool> {
+    pub async fn mark_peer_identity_verified(&self, username: &str, peer: &str) -> Result<bool> {
         let username = username.to_string();
         let peer = peer.to_string();
         let mut tx = self.db.begin().await?;
