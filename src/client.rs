@@ -29,6 +29,19 @@ use x25519_dalek as x25519;
 
 type StdinLines = tokio::io::Lines<BufReader<io::Stdin>>;
 
+mod tui;
+
+enum ClientMode {
+    Chat {
+        username: String,
+        receiver: Option<String>,
+    },
+    Ratatui {
+        username: String,
+        receiver: Option<String>,
+    },
+}
+
 /// ActiveConversation represents a conversation with some receiver and its associated ratchet
 /// state.
 struct ActiveConversation {
@@ -728,13 +741,32 @@ mod tests {
     }
 }
 
-fn parse_args() -> Result<(String, Option<String>)> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        return Err(anyhow!("usage: newspeak <you> [optional username]"));
+fn parse_args() -> Result<ClientMode> {
+    let mut use_ratatui = false;
+    let mut positional = Vec::new();
+
+    for arg in std::env::args().skip(1) {
+        if arg == "--ratatui" || arg == "--ratatui-example" {
+            use_ratatui = true;
+        } else {
+            positional.push(arg);
+        }
     }
 
-    Ok((args[1].clone(), args.get(2).cloned()))
+    if positional.is_empty() {
+        return Err(anyhow!(
+            "usage: newspeak <you> [optional username]\n       newspeak --ratatui <you> [optional username]"
+        ));
+    }
+
+    let username = positional[0].clone();
+    let receiver = positional.get(1).cloned();
+
+    if use_ratatui {
+        Ok(ClientMode::Ratatui { username, receiver })
+    } else {
+        Ok(ClientMode::Chat { username, receiver })
+    }
 }
 
 fn stdin_lines() -> StdinLines {
@@ -1295,12 +1327,19 @@ pub async fn run() -> Result<()> {
     //
     // TODO: currently they could keep spamming the register route to prevent a legitimate user
     // from registering. there should be some blocking in place to prevent abuse.
-    let (username, receiver_arg) = match parse_args() {
-        Ok(args) => args,
+    let mode = match parse_args() {
+        Ok(mode) => mode,
         Err(err) => {
             println!("{}", err);
             std::process::exit(1);
         }
+    };
+
+    let (username, receiver_arg) = match mode {
+        ClientMode::Ratatui { username, receiver } => {
+            return tui::run(username, receiver).await;
+        }
+        ClientMode::Chat { username, receiver } => (username, receiver),
     };
 
     let client = NewspeakClient::connect("http://[::1]:10000").await?;

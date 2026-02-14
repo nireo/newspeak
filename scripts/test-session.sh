@@ -31,8 +31,8 @@ fi
 echo "starting tmux session '$SESSION_NAME'..."
 
 tmux new-session -d -s "$SESSION_NAME" -n server "cd \"$ROOT_DIR\" && cargo run --bin server"
-tmux new-window -t "$SESSION_NAME:" -n "$USER_A" "cd \"$ROOT_DIR\" && sleep 2 && cargo run --bin client -- \"$USER_A\""
-tmux new-window -t "$SESSION_NAME:" -n "$USER_B" "cd \"$ROOT_DIR\" && sleep 2 && cargo run --bin client -- \"$USER_B\""
+tmux new-window -t "$SESSION_NAME:" -n "$USER_A" "cd \"$ROOT_DIR\" && sleep 2 && cargo run --bin client -- --ratatui \"$USER_A\""
+tmux new-window -t "$SESSION_NAME:" -n "$USER_B" "cd \"$ROOT_DIR\" && sleep 2 && cargo run --bin client -- --ratatui \"$USER_B\""
 tmux select-window -t "$SESSION_NAME:server"
 
 echo "done. windows: server, $USER_A, $USER_B"
