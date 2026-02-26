@@ -191,6 +191,33 @@ impl<'a> User<'a> {
             peer_identity,
         ))
     }
+
+    /// send_join_request sends a join request to the server with the user's signed authentication
+    /// challenge.
+    async fn send_join_request(&self, tx: &mpsc::Sender<ClientMessage>) -> Result<()> {
+        let auth_signature = self.sign_auth_challenge().await?;
+        tx.send(ClientMessage {
+            message_type: Some(client_message::MessageType::JoinRequest(JoinRequest {
+                username: self.username.to_string(),
+                signature: auth_signature,
+            })),
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn setup_message_stream(
+        &self,
+    ) -> Result<(mpsc::Sender<ClientMessage>, tonic::Streaming<ServerMessage>)> {
+        let (tx, rx) = mpsc::channel(32);
+        let response = self
+            .client
+            .clone()
+            .message_stream(ReceiverStream::new(rx))
+            .await?;
+
+        Ok((tx, response.into_inner()))
+    }
 }
 
 impl TryFrom<&newspeak::PrekeyBundle> for PrekeyBundle {
@@ -466,33 +493,6 @@ fn parse_args() -> Result<(String, Option<String>)> {
     }
 
     Ok((positional[0].clone(), positional.get(1).cloned()))
-}
-
-/// setup_message_stream sets up the gRPC message stream with the server for the given user.
-async fn setup_message_stream(
-    user: &User<'_>,
-) -> Result<(mpsc::Sender<ClientMessage>, tonic::Streaming<ServerMessage>)> {
-    let (tx, rx) = mpsc::channel(32);
-    let response = user
-        .client
-        .clone()
-        .message_stream(ReceiverStream::new(rx))
-        .await?;
-    Ok((tx, response.into_inner()))
-}
-
-/// send_join_request sends a join request to the server with the user's signed authentication
-/// challenge.
-async fn send_join_request(user: &User<'_>, tx: &mpsc::Sender<ClientMessage>) -> Result<()> {
-    let auth_signature = user.sign_auth_challenge().await?;
-    tx.send(ClientMessage {
-        message_type: Some(client_message::MessageType::JoinRequest(JoinRequest {
-            username: user.username.to_string(),
-            signature: auth_signature,
-        })),
-    })
-    .await?;
-    Ok(())
 }
 
 pub async fn run() -> Result<()> {

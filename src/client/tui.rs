@@ -231,80 +231,48 @@ fn byte_index_for_char(s: &str, char_index: usize) -> usize {
 }
 
 fn render_ratatui_chat(frame: &mut ratatui::Frame<'_>, app: &TuiAppState) {
-    let app_bg = Color::Rgb(15, 18, 24);
-    let panel_bg = Color::Rgb(24, 29, 38);
-    let panel_alt_bg = Color::Rgb(20, 25, 34);
-    let text = Color::Rgb(227, 232, 241);
-    let muted = Color::Rgb(146, 155, 172);
-    let accent = Color::Rgb(92, 162, 255);
+    let panel_style = Style::default().bg(Color::Reset).fg(Color::White);
+    let muted_style = Style::default().fg(Color::Gray).add_modifier(Modifier::DIM);
+    let border_style = Style::default().fg(Color::DarkGray);
+    let key_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
 
-    frame.render_widget(
-        Block::default().style(Style::default().bg(app_bg)),
-        frame.area(),
-    );
+    frame.render_widget(Block::default().style(panel_style), frame.area());
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(10),
-            Constraint::Length(3),
-        ])
+        .constraints([Constraint::Min(10), Constraint::Length(2)])
         .margin(1)
         .split(frame.area());
-
-    let connection = if app.joined { "joined" } else { "joining..." };
-    let header = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "NEWSPEAK",
-            Style::default().fg(text).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ratatui client", Style::default().fg(muted)),
-        Span::raw("  "),
-        Span::styled(
-            format!(" {} ", app.username),
-            Style::default()
-                .fg(app_bg)
-                .bg(accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(connection, Style::default().fg(muted)),
-    ]))
-    .style(Style::default().bg(app_bg))
-    .block(
-        Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(panel_bg)),
-    );
 
     let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-        .split(chunks[1]);
+        .split(chunks[0]);
 
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(6), Constraint::Length(4)])
         .split(body_chunks[0]);
 
-    let max_lines = usize::from(left_chunks[0].height.saturating_sub(3));
+    let max_lines = usize::from(left_chunks[0].height.saturating_sub(1));
     let start = app.messages.len().saturating_sub(max_lines);
     let mut message_lines = Vec::new();
     for message in app.messages.iter().skip(start) {
         let sender_style = match message.kind {
-            TuiLineKind::System => Style::default().fg(muted),
-            TuiLineKind::Incoming => Style::default().fg(text).add_modifier(Modifier::BOLD),
-            TuiLineKind::Outgoing => Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            TuiLineKind::System => muted_style,
+            TuiLineKind::Incoming => key_style,
+            TuiLineKind::Outgoing => Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::ITALIC),
         };
         let body_style = match message.kind {
-            TuiLineKind::System => Style::default().fg(muted),
-            _ => Style::default().fg(text),
+            TuiLineKind::System => muted_style,
+            _ => Style::default().fg(Color::White),
         };
         message_lines.push(Line::from(vec![
             Span::styled(
                 format!("[{}] ", super::format_timestamp(message.timestamp)),
-                Style::default().fg(muted),
+                muted_style,
             ),
             Span::styled(format!("{}: ", message.sender), sender_style),
             Span::styled(message.content.as_str(), body_style),
@@ -313,31 +281,23 @@ fn render_ratatui_chat(frame: &mut ratatui::Frame<'_>, app: &TuiAppState) {
     if message_lines.is_empty() {
         message_lines.push(Line::from(Span::styled(
             "No messages yet. Use /init <username> to start a conversation.",
-            Style::default().fg(muted),
+            muted_style,
         )));
     }
 
     let message_panel = Paragraph::new(message_lines)
+        .style(panel_style)
         .wrap(Wrap { trim: false })
         .block(
             Block::default()
-                .title("chat")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(31, 38, 50)))
-                .style(Style::default().bg(panel_bg))
-                .padding(Padding::new(1, 1, 1, 1)),
+                .style(panel_style)
+                .padding(Padding::new(1, 1, 0, 0)),
         );
 
-    let input_title = match app.active_peer.as_deref() {
-        Some(peer) => format!("message -> {}", peer),
-        None => "message (select or /init first)".to_string(),
-    };
-
     let input_block = Block::default()
-        .title(input_title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(36, 45, 60)))
-        .style(Style::default().bg(panel_alt_bg))
+        .style(panel_style)
+        .borders(Borders::TOP)
+        .border_style(border_style)
         .padding(Padding::new(1, 1, 0, 0));
     let input_inner = input_block.inner(left_chunks[1]);
     let input_width = usize::from(input_inner.width);
@@ -348,13 +308,13 @@ fn render_ratatui_chat(frame: &mut ratatui::Frame<'_>, app: &TuiAppState) {
     let visible_input = &app.input[start_byte..];
 
     let input_panel = Paragraph::new(visible_input)
-        .style(Style::default().fg(text))
+        .style(panel_style)
         .block(input_block);
 
     let items: Vec<ListItem<'_>> = if app.conversations.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "No conversations",
-            Style::default().fg(muted),
+            muted_style,
         )))]
     } else {
         app.conversations
@@ -363,17 +323,14 @@ fn render_ratatui_chat(frame: &mut ratatui::Frame<'_>, app: &TuiAppState) {
                 let is_active = app.active_peer.as_deref() == Some(peer.as_str());
                 let unread = app.unread_counts.get(peer).copied().unwrap_or(0);
                 let mut spans = vec![if is_active {
-                    Span::styled("● ", Style::default().fg(accent))
+                    Span::styled("> ", key_style)
                 } else {
-                    Span::styled("  ", Style::default().fg(muted))
+                    Span::raw("  ")
                 }];
-                spans.push(Span::styled(peer.as_str(), Style::default().fg(text)));
+                spans.push(Span::styled(peer.as_str(), Style::default().fg(Color::White)));
                 if unread > 0 {
                     spans.push(Span::raw(" "));
-                    spans.push(Span::styled(
-                        format!("({})", unread),
-                        Style::default().fg(accent),
-                    ));
+                    spans.push(Span::styled(format!("({})", unread), key_style));
                 }
                 ListItem::new(Line::from(spans))
             })
@@ -381,16 +338,13 @@ fn render_ratatui_chat(frame: &mut ratatui::Frame<'_>, app: &TuiAppState) {
     };
 
     let sidebar = List::new(items)
-        .highlight_style(
-            Style::default()
-                .fg(text)
-                .bg(Color::Rgb(31, 38, 50))
-                .add_modifier(Modifier::BOLD),
-        )
+        .style(panel_style)
+        .highlight_style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
         .block(
             Block::default()
-                .title("conversations")
-                .style(Style::default().bg(panel_alt_bg))
+                .borders(Borders::LEFT)
+                .style(panel_style)
+                .border_style(border_style)
                 .padding(Padding::new(1, 1, 1, 1)),
         );
     let mut list_state = ListState::default();
@@ -401,37 +355,38 @@ fn render_ratatui_chat(frame: &mut ratatui::Frame<'_>, app: &TuiAppState) {
         ));
     }
 
+    let connection = if app.joined { "joined" } else { "joining..." };
     let footer = Paragraph::new(Line::from(vec![
+        Span::styled("Status: ", key_style),
         Span::styled(
-            "Status: ",
-            Style::default().fg(text).add_modifier(Modifier::BOLD),
+            format!("{} | {} | {}", app.username, connection, app.status),
+            muted_style,
         ),
-        Span::styled(app.status.as_str(), Style::default().fg(muted)),
         Span::raw("  "),
-        Span::styled("up/down", Style::default().fg(accent)),
-        Span::styled(" select", Style::default().fg(muted)),
+        Span::styled("up/down", key_style),
+        Span::styled(" select", muted_style),
         Span::raw("  "),
-        Span::styled("enter", Style::default().fg(accent)),
-        Span::styled(" send/switch", Style::default().fg(muted)),
+        Span::styled("enter", key_style),
+        Span::styled(" send/switch", muted_style),
         Span::raw("  "),
-        Span::styled("tab", Style::default().fg(accent)),
-        Span::styled(" open", Style::default().fg(muted)),
+        Span::styled("tab", key_style),
+        Span::styled(" open", muted_style),
         Span::raw("  "),
-        Span::styled("ctrl+c", Style::default().fg(accent)),
-        Span::styled(" quit", Style::default().fg(muted)),
+        Span::styled("ctrl+c", key_style),
+        Span::styled(" quit", muted_style),
     ]))
-    .style(Style::default().bg(app_bg))
+    .style(panel_style)
     .block(
         Block::default()
+            .style(panel_style)
             .borders(Borders::TOP)
-            .border_style(Style::default().fg(panel_bg)),
+            .border_style(border_style),
     );
 
-    frame.render_widget(header, chunks[0]);
     frame.render_widget(message_panel, left_chunks[0]);
     frame.render_widget(input_panel, left_chunks[1]);
     frame.render_stateful_widget(sidebar, body_chunks[1], &mut list_state);
-    frame.render_widget(footer, chunks[2]);
+    frame.render_widget(footer, chunks[1]);
 
     if input_inner.width > 0 && input_inner.height > 0 {
         let cursor_chars = input_chars.saturating_sub(start_char);
@@ -1032,15 +987,15 @@ impl TuiAppState {
     }
 }
 
-pub(super) async fn run(username: String, receiver_arg: Option<String>) -> Result<()> {
+pub async fn run(username: String, receiver_arg: Option<String>) -> Result<()> {
     let client = NewspeakClient::connect("http://[::1]:10000").await?;
     let storage = LocalStorage::new(&username).await?;
     let key_info = storage.load_or_create_user(&username).await?;
     let mut user = User::new(&username, client, key_info);
     user.register().await?;
 
-    let (tx, inbound) = super::setup_message_stream(&user).await?;
-    super::send_join_request(&user, &tx).await?;
+    let (tx, inbound) = user.setup_message_stream().await?;
+    user.send_join_request(&tx).await?;
 
     let initial_receiver = receiver_arg.filter(|receiver| !receiver.trim().is_empty());
     let mut app = TuiAppState::new(username.clone(), initial_receiver.clone());
