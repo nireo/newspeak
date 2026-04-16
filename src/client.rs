@@ -103,6 +103,7 @@ impl<'a> User<'a> {
                 kem_prekeys,
             )
         };
+
         let req = RegisterRequest {
             username: self.username.into(),
             identity_key,
@@ -118,6 +119,7 @@ impl<'a> User<'a> {
                 response.auth_challenge.len()
             )
         })?;
+
         self.auth_challenge = Some(challenge);
         if !kem_prekeys.is_empty() {
             self.client
@@ -137,6 +139,7 @@ impl<'a> User<'a> {
         let challenge = self
             .auth_challenge
             .ok_or_else(|| anyhow!("missing auth challenge; register first"))?;
+
         let key_info = self.key_info.lock().await;
         let signature = key_info.identity_sk.sign(&challenge);
         Ok(signature.to_bytes().to_vec())
@@ -445,6 +448,32 @@ fn ratchet_aad(sender_id: &str, receiver_id: &str) -> Vec<u8> {
     aad
 }
 
+fn parse_args() -> Result<(String, Option<String>)> {
+    let mut positional = Vec::new();
+
+    for arg in std::env::args().skip(1) {
+        positional.push(arg);
+    }
+
+    if positional.is_empty() {
+        return Err(anyhow!("usage: newspeak <you> [optional username]"));
+    }
+
+    Ok((positional[0].clone(), positional.get(1).cloned()))
+}
+
+pub async fn run() -> Result<()> {
+    let (username, receiver_arg) = match parse_args() {
+        Ok(args) => args,
+        Err(err) => {
+            println!("{}", err);
+            std::process::exit(1);
+        }
+    };
+
+    tui::run(username, receiver_arg).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,33 +505,4 @@ mod tests {
         let wrong_aad = ratchet_aad("alice", "carol");
         assert!(bob.receive_message(message, &wrong_aad).is_err());
     }
-}
-
-fn parse_args() -> Result<(String, Option<String>)> {
-    let mut positional = Vec::new();
-
-    for arg in std::env::args().skip(1) {
-        if arg == "--ratatui" || arg == "--ratatui-example" {
-            continue;
-        }
-        positional.push(arg);
-    }
-
-    if positional.is_empty() {
-        return Err(anyhow!("usage: newspeak <you> [optional username]"));
-    }
-
-    Ok((positional[0].clone(), positional.get(1).cloned()))
-}
-
-pub async fn run() -> Result<()> {
-    let (username, receiver_arg) = match parse_args() {
-        Ok(args) => args,
-        Err(err) => {
-            println!("{}", err);
-            std::process::exit(1);
-        }
-    };
-
-    tui::run(username, receiver_arg).await
 }
