@@ -46,6 +46,7 @@ struct TuiChatLine {
 
 struct TuiAppState {
     username: String,
+    local_identity: [u8; 32],
     active_peer: Option<String>,
     active_ratchet: Option<RatchetState>,
     conversations: Vec<String>,
@@ -54,14 +55,16 @@ struct TuiAppState {
     messages: Vec<TuiChatLine>,
     input: String,
     status: String,
+    safety_number: Option<String>,
     joined: bool,
     should_quit: bool,
 }
 
 impl TuiAppState {
-    fn new(username: String, active_peer: Option<String>) -> Self {
+    fn new(username: String, active_peer: Option<String>, local_identity: [u8; 32]) -> Self {
         Self {
             username,
+            local_identity,
             active_peer,
             active_ratchet: None,
             conversations: Vec::new(),
@@ -70,6 +73,7 @@ impl TuiAppState {
             messages: Vec::new(),
             input: String::new(),
             status: "Connecting to server...".to_string(),
+            safety_number: None,
             joined: false,
             should_quit: false,
         }
@@ -189,6 +193,17 @@ impl TuiAppState {
 
         self.ensure_conversation(peer);
         self.refresh_tui_conversations(storage, username).await?;
+
+        self.safety_number = None;
+        if let Some(peer_identity) = storage.get_peer_identity(username, peer).await? {
+            if !peer_identity.verified {
+                self.safety_number = Some(verification::safety_number_string(
+                    &self.local_identity,
+                    &peer_identity.identity_key,
+                ));
+            }
+        }
+
         self.set_status(format!("active conversation: {}", peer));
 
         Ok(())
@@ -235,6 +250,7 @@ fn render_ratatui_chat(frame: &mut ratatui::Frame<'_>, app: &TuiAppState) {
     let muted_style = Style::default().fg(Color::Gray).add_modifier(Modifier::DIM);
     let border_style = Style::default().fg(Color::DarkGray);
     let key_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let warn_style = Style::default().fg(Color::Yellow);
 
     frame.render_widget(Block::default().style(panel_style), frame.area());
 
@@ -246,15 +262,36 @@ fn render_ratatui_chat(frame: &mut ratatui::Frame<'_>, app: &TuiAppState) {
 
     let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .constraints([Constraint::Percentage(78), Constraint::Percentage(22)])
         .split(chunks[0]);
 
+    let safety_height = if app.safety_number.is_some() { 4u16 } else { 0u16 };
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(6), Constraint::Length(4)])
+        .constraints([
+            Constraint::Length(safety_height),
+            Constraint::Min(6),
+            Constraint::Length(4),
+        ])
         .split(body_chunks[0]);
 
-    let max_lines = usize::from(left_chunks[0].height.saturating_sub(1));
+    if let Some(safety_number) = &app.safety_number {
+        let safety_block = Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(border_style)
+            .padding(Padding::new(1, 1, 0, 0));
+        let safety_text = vec![
+            Line::from(Span::styled("Safety number:", warn_style)),
+            Line::from(Span::styled(safety_number.as_str(), muted_style)),
+        ];
+        let safety_panel = Paragraph::new(safety_text)
+            .style(panel_style)
+            .wrap(Wrap { trim: false })
+            .block(safety_block);
+        frame.render_widget(safety_panel, left_chunks[0]);
+    }
+
+    let max_lines = usize::from(left_chunks[1].height.saturating_sub(1));
     let start = app.messages.len().saturating_sub(max_lines);
     let mut message_lines = Vec::new();
     for message in app.messages.iter().skip(start) {
@@ -299,7 +336,7 @@ fn render_ratatui_chat(frame: &mut ratatui::Frame<'_>, app: &TuiAppState) {
         .borders(Borders::TOP)
         .border_style(border_style)
         .padding(Padding::new(1, 1, 0, 0));
-    let input_inner = input_block.inner(left_chunks[1]);
+    let input_inner = input_block.inner(left_chunks[2]);
     let input_width = usize::from(input_inner.width);
     let input_chars = app.input.chars().count();
     let visible_chars = input_width.saturating_sub(1);
@@ -383,8 +420,8 @@ fn render_ratatui_chat(frame: &mut ratatui::Frame<'_>, app: &TuiAppState) {
             .border_style(border_style),
     );
 
-    frame.render_widget(message_panel, left_chunks[0]);
-    frame.render_widget(input_panel, left_chunks[1]);
+    frame.render_widget(message_panel, left_chunks[1]);
+    frame.render_widget(input_panel, left_chunks[2]);
     frame.render_stateful_widget(sidebar, body_chunks[1], &mut list_state);
     frame.render_widget(footer, chunks[1]);
 
@@ -495,6 +532,7 @@ impl TuiAppState {
         if show_safety {
             let safety_number = verification::safety_number_string(&local_identity, &peer_identity);
             if self.active_peer.as_deref() == Some(message.sender_id.as_str()) {
+                self.safety_number = Some(safety_number.clone());
                 self.push_system_line(
                     timestamp,
                     format!(
@@ -736,11 +774,8 @@ impl TuiAppState {
             PeerIdentityStoreResult::ExistingMismatch => false,
         };
         if show_safety {
-            let local_identity = {
-                let key_info = user.key_info.lock().await;
-                key_info.identity_pk.to_bytes()
-            };
-            let safety_number = verification::safety_number_string(&local_identity, &peer_identity);
+            let safety_number = verification::safety_number_string(&self.local_identity, &peer_identity);
+            self.safety_number = Some(safety_number.clone());
             self.push_system_line(
                 super::now_unix_seconds(),
                 format!("safety number with {}: {}", receiver, safety_number),
@@ -911,6 +946,7 @@ impl TuiAppState {
                 .await
             {
                 Ok(true) => {
+                    self.safety_number = None;
                     self.push_system_line(
                         super::now_unix_seconds(),
                         format!("marked {} as verified", receiver),
@@ -998,7 +1034,11 @@ pub async fn run(username: String, receiver_arg: Option<String>) -> Result<()> {
     user.send_join_request(&tx).await?;
 
     let initial_receiver = receiver_arg.filter(|receiver| !receiver.trim().is_empty());
-    let mut app = TuiAppState::new(username.clone(), initial_receiver.clone());
+    let local_identity = {
+        let key_info = user.key_info.lock().await;
+        key_info.identity_pk.to_bytes()
+    };
+    let mut app = TuiAppState::new(username.clone(), initial_receiver.clone(), local_identity);
     if let Some(receiver) = initial_receiver.as_deref() {
         app.activate_tui_conversation(&storage, &username, receiver)
             .await?;
