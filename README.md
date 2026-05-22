@@ -1,5 +1,7 @@
 # newspeak
 
+![newspeak TUI screenshot](assets/example.png)
+
 `newspeak` is an end-to-end encrypted terminal chat application written in Rust. It uses Signal's [PQXDH](https://signal.org/docs/specifications/pqxdh/) protocol for key agreement and a [Double Ratchet](https://signal.org/docs/specifications/doubleratchet/) implementation for message encryption. The initial key agreement is post-quantum, but the message layer is still Double Ratchet, so the project is not yet fully post-quantum end-to-end. Signal has published documents detailing a post-quantum Triple Ratchet design, but that has not yet been implemented here.
 
 This is a Rust rewrite of my earlier Go project [pch](https://github.com/nireo/pch), mainly to experiment with using Rust for cryptography work.
