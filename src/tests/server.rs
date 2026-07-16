@@ -393,6 +393,50 @@ async fn offline_messages_are_scoped_to_receiver() {
 }
 
 #[tokio::test]
+async fn failed_online_delivery_is_stored_offline() {
+    let svc = test_service().await;
+    let (peer_tx, peer_rx) = mpsc::channel(1);
+    drop(peer_rx);
+    svc.users.insert("bob".to_string(), peer_tx);
+
+    let key_exchange = newspeak::KeyExchangeMessage {
+        sender_id: "alice".to_string(),
+        receiver_id: "bob".to_string(),
+        initial_message: None,
+        timestamp: None,
+    };
+    let client_message = ClientMessage {
+        message_type: Some(client_message::MessageType::KeyExchangeMessage(
+            key_exchange.clone(),
+        )),
+    };
+    let server_message = ServerMessage {
+        message_type: Some(server_message::MessageType::KeyExchange(key_exchange)),
+    };
+
+    svc.forward_message(
+        "bob".to_string(),
+        server_message,
+        client_message,
+        42,
+        &svc.users,
+    )
+    .await
+    .unwrap();
+
+    assert!(!svc.users.contains_key("bob"));
+    let stored = svc.server_store.get_offline_messages("bob").await.unwrap();
+    assert_eq!(stored.len(), 1);
+    let decoded = ClientMessage::decode(stored[0].message.as_slice()).unwrap();
+    let Some(client_message::MessageType::KeyExchangeMessage(message)) = decoded.message_type
+    else {
+        panic!("expected stored key exchange message");
+    };
+    assert_eq!(message.sender_id, "alice");
+    assert_eq!(message.receiver_id, "bob");
+}
+
+#[tokio::test]
 async fn delete_offline_messages_respects_timestamp() {
     let svc = test_service().await;
 

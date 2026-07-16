@@ -411,13 +411,17 @@ impl NewspeakService {
         created_at: i64,
         users: &Arc<DashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>,
     ) -> Result<(), Status> {
-        // check if the target user is online
-        if let Some(peer_tx) = users.get(&target) {
-            let _ = peer_tx.send(Ok(server_message)).await;
-            return Ok(());
+        // Clone the sender out of the map so no DashMap guard is held across the await.
+        if let Some(peer_tx) = users.get(&target).map(|entry| entry.value().clone()) {
+            if peer_tx.send(Ok(server_message)).await.is_ok() {
+                return Ok(());
+            }
+
+            // Remove only the channel that failed; the user may have reconnected while sending.
+            users.remove_if(&target, |_, current| current.same_channel(&peer_tx));
         }
 
-        // the user is offline therefore we need to store the message as an offline message
+        // The user is offline or its channel closed, so store the message for later delivery.
         let kind: OfflineMessageKind = (&client_message)
             .try_into()
             .map_err(|_| Status::invalid_argument("unsupported offline message type"))?;
