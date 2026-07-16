@@ -420,7 +420,7 @@ impl LocalStorage {
         };
         let ratchet_state: Vec<u8> = row.get(0);
 
-        Ok(Some(ratchet_state_from_bytes(&ratchet_state)?))
+        Ok(Some(serde_json::from_slice(&ratchet_state)?))
     }
 
     pub async fn update_conversation(
@@ -429,7 +429,7 @@ impl LocalStorage {
         peer: &str,
         ratchet_state: &RatchetState,
     ) -> Result<()> {
-        let ratchet_state = ratchet_state_to_bytes(ratchet_state);
+        let ratchet_state = serde_json::to_vec(ratchet_state)?;
         let username = username.to_string();
         let peer = peer.to_string();
 
@@ -793,80 +793,6 @@ fn bytes_to_16(bytes: &[u8]) -> Result<[u8; 16]> {
     bytes
         .try_into()
         .map_err(|_| anyhow!("invalid key length: {}", bytes.len()))
-}
-
-fn ratchet_state_to_bytes(state: &RatchetState) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(209);
-    bytes.extend_from_slice(&state.sending_sk.to_bytes());
-    bytes.extend_from_slice(state.sending_pk.as_bytes());
-    match &state.receiving_pk {
-        Some(pk) => {
-            bytes.push(1u8);
-            bytes.extend_from_slice(pk.as_bytes());
-        }
-        None => {
-            bytes.push(0u8);
-            bytes.extend_from_slice(&[0u8; 32]);
-        }
-    }
-    bytes.extend_from_slice(&state.receiving_counter.to_le_bytes());
-    bytes.extend_from_slice(&state.sending_counter.to_le_bytes());
-    bytes.extend_from_slice(&state.root_key);
-    bytes.extend_from_slice(&state.chain_key_sending);
-    bytes.extend_from_slice(&state.chain_key_receiving);
-    bytes
-}
-
-fn ratchet_state_from_bytes(bytes: &[u8]) -> Result<RatchetState> {
-    const EXPECTED_LEN: usize = 209;
-    if bytes.len() != EXPECTED_LEN {
-        return Err(anyhow!("invalid ratchet state length: {}", bytes.len()));
-    }
-
-    let mut offset = 0;
-    let sending_sk = bytes_to_32(&bytes[offset..offset + 32])?;
-    offset += 32;
-    let sending_pk = bytes_to_32(&bytes[offset..offset + 32])?;
-    offset += 32;
-    let has_receiving = bytes[offset];
-    offset += 1;
-    let receiving_pk_bytes = bytes_to_32(&bytes[offset..offset + 32])?;
-    offset += 32;
-    let receiving_counter = u64::from_le_bytes(
-        bytes[offset..offset + 8]
-            .try_into()
-            .map_err(|_| anyhow!("invalid receiving counter length"))?,
-    );
-    offset += 8;
-    let sending_counter = u64::from_le_bytes(
-        bytes[offset..offset + 8]
-            .try_into()
-            .map_err(|_| anyhow!("invalid sending counter length"))?,
-    );
-    offset += 8;
-    let root_key = bytes_to_32(&bytes[offset..offset + 32])?;
-    offset += 32;
-    let chain_key_sending = bytes_to_32(&bytes[offset..offset + 32])?;
-    offset += 32;
-    let chain_key_receiving = bytes_to_32(&bytes[offset..offset + 32])?;
-
-    let receiving_pk = if has_receiving == 1 {
-        Some(x25519::PublicKey::from(receiving_pk_bytes))
-    } else {
-        None
-    };
-
-    Ok(RatchetState {
-        sending_sk: x25519::StaticSecret::from(sending_sk),
-        sending_pk: x25519::PublicKey::from(sending_pk),
-        receiving_pk,
-        receiving_counter,
-        sending_counter,
-        root_key,
-        chain_key_sending,
-        chain_key_receiving,
-        skipped_message_keys: std::collections::HashMap::new(),
-    })
 }
 
 #[cfg(test)]

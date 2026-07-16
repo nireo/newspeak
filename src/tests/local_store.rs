@@ -211,6 +211,34 @@ async fn conversation_roundtrip() -> Result<()> {
     assert_eq!(alice.root_key, loaded.root_key);
     assert_eq!(alice.chain_key_sending, loaded.chain_key_sending);
     assert_eq!(alice.chain_key_receiving, loaded.chain_key_receiving);
+    assert_eq!(alice.skipped_message_keys, loaded.skipped_message_keys);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn conversation_roundtrip_preserves_skipped_message_keys() -> Result<()> {
+    let db = TempDb::new();
+    let storage = LocalStorage::new_with_path(&db.path).await?;
+    storage.load_or_create_user("bob").await?;
+
+    let shared_key: [u8; 32] = rand::random();
+    let mut bob = RatchetState::as_receiver(shared_key);
+    let mut alice = RatchetState::as_initiator(shared_key, bob.sending_pk);
+    let aad = b"ratchet-ad";
+    let first = alice.send_message("one", aad)?;
+    let second = alice.send_message("two", aad)?;
+
+    assert_eq!(bob.receive_message(second, aad)?, "two");
+    assert_eq!(bob.skipped_message_keys.len(), 1);
+    storage.update_conversation("bob", "alice", &bob).await?;
+
+    let mut loaded = storage
+        .get_conversation("bob", "alice")
+        .await?
+        .expect("conversation");
+    assert_eq!(loaded.skipped_message_keys.len(), 1);
+    assert_eq!(loaded.receive_message(first, aad)?, "one");
 
     Ok(())
 }

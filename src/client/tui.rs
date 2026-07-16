@@ -249,7 +249,9 @@ fn render_ratatui_chat(frame: &mut ratatui::Frame<'_>, app: &TuiAppState) {
     let panel_style = Style::default().bg(Color::Reset).fg(Color::White);
     let muted_style = Style::default().fg(Color::Gray).add_modifier(Modifier::DIM);
     let border_style = Style::default().fg(Color::DarkGray);
-    let key_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let key_style = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
     let warn_style = Style::default().fg(Color::Yellow);
 
     frame.render_widget(Block::default().style(panel_style), frame.area());
@@ -265,7 +267,11 @@ fn render_ratatui_chat(frame: &mut ratatui::Frame<'_>, app: &TuiAppState) {
         .constraints([Constraint::Percentage(78), Constraint::Percentage(22)])
         .split(chunks[0]);
 
-    let safety_height = if app.safety_number.is_some() { 4u16 } else { 0u16 };
+    let safety_height = if app.safety_number.is_some() {
+        4u16
+    } else {
+        0u16
+    };
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -364,7 +370,10 @@ fn render_ratatui_chat(frame: &mut ratatui::Frame<'_>, app: &TuiAppState) {
                 } else {
                     Span::raw("  ")
                 }];
-                spans.push(Span::styled(peer.as_str(), Style::default().fg(Color::White)));
+                spans.push(Span::styled(
+                    peer.as_str(),
+                    Style::default().fg(Color::White),
+                ));
                 if unread > 0 {
                     spans.push(Span::raw(" "));
                     spans.push(Span::styled(format!("({})", unread), key_style));
@@ -376,7 +385,11 @@ fn render_ratatui_chat(frame: &mut ratatui::Frame<'_>, app: &TuiAppState) {
 
     let sidebar = List::new(items)
         .style(panel_style)
-        .highlight_style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
         .block(
             Block::default()
                 .borders(Borders::LEFT)
@@ -774,7 +787,8 @@ impl TuiAppState {
             PeerIdentityStoreResult::ExistingMismatch => false,
         };
         if show_safety {
-            let safety_number = verification::safety_number_string(&self.local_identity, &peer_identity);
+            let safety_number =
+                verification::safety_number_string(&self.local_identity, &peer_identity);
             self.safety_number = Some(safety_number.clone());
             self.push_system_line(
                 super::now_unix_seconds(),

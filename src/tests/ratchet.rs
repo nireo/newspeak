@@ -75,6 +75,40 @@ fn ratchet_rejects_message_with_tampered_counter() {
 }
 
 #[test]
+fn failed_authentication_does_not_advance_ratchet_state() {
+    let shared_key: [u8; 32] = rand::random();
+    let mut bob = RatchetState::as_receiver(shared_key);
+    let mut alice = RatchetState::as_initiator(shared_key, bob.sending_pk);
+
+    let ad = b"ratchet-ad";
+    let message = alice.send_message("secret", ad).unwrap();
+    let mut tampered = message.clone();
+    tampered.ciphertext[0] ^= 1;
+
+    assert!(bob.receive_message(tampered, ad).is_err());
+    assert_eq!(bob.receiving_counter, 0);
+    assert_eq!(bob.receiving_pk, None);
+    assert_eq!(bob.receive_message(message, ad).unwrap(), "secret");
+}
+
+#[test]
+fn failed_authentication_does_not_consume_skipped_key() {
+    let shared_key: [u8; 32] = rand::random();
+    let mut bob = RatchetState::as_receiver(shared_key);
+    let mut alice = RatchetState::as_initiator(shared_key, bob.sending_pk);
+
+    let ad = b"ratchet-ad";
+    let first = alice.send_message("one", ad).unwrap();
+    let second = alice.send_message("two", ad).unwrap();
+    assert_eq!(bob.receive_message(second, ad).unwrap(), "two");
+
+    let mut tampered = first.clone();
+    tampered.ciphertext[0] ^= 1;
+    assert!(bob.receive_message(tampered, ad).is_err());
+    assert_eq!(bob.receive_message(first, ad).unwrap(), "one");
+}
+
+#[test]
 fn ratchet_handles_out_of_order_messages() {
     let shared_key: [u8; 32] = rand::random();
     let mut bob = RatchetState::as_receiver(shared_key);

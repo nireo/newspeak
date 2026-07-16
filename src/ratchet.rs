@@ -3,6 +3,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit,
     aead::{AeadMut, Payload},
 };
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use std::collections::HashMap;
 use x25519_dalek as ecdh;
 use x25519_dalek as x25519;
@@ -10,7 +11,7 @@ use x25519_dalek as x25519;
 const MAX_SKIPPED_MESSAGES: u64 = 128;
 const MAX_SKIPPED_KEYS: usize = 128;
 
-#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SkippedKeyId {
     pk: [u8; 32],
     counter: u64,
@@ -28,6 +29,7 @@ impl SkippedKeyId {
 /// RatchetState represents a conversation state between two parties. It holds the sending and
 /// receiving public keys, counters, root key, and chain keys for both sending and receiving.
 /// This is described by Signal's Double Ratchet Algorithm spec.
+#[derive(Clone)]
 pub struct RatchetState {
     pub sending_sk: ecdh::StaticSecret,
     pub sending_pk: ecdh::PublicKey,
@@ -43,6 +45,7 @@ pub struct RatchetState {
 
 /// Ratchet message header contains the public key, message counter, and nonce. Here the nonce is
 /// 96 bits which is fine since we use a unique key for each message.
+#[derive(Clone)]
 pub struct RatchetMessageHeader {
     pub pk: ecdh::PublicKey,
     pub counter: u64,
@@ -50,9 +53,78 @@ pub struct RatchetMessageHeader {
 }
 
 /// RatchetMessageHeader contains the header and the actual content of the message being decrypted.
+#[derive(Clone)]
 pub struct RatchetMessage {
     pub header: RatchetMessageHeader,
     pub ciphertext: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedRatchetState {
+    sending_sk: [u8; 32],
+    receiving_pk: Option<[u8; 32]>,
+    receiving_counter: u64,
+    sending_counter: u64,
+    root_key: [u8; 32],
+    chain_key_sending: [u8; 32],
+    chain_key_receiving: [u8; 32],
+    skipped_message_keys: Vec<(SkippedKeyId, [u8; 32])>,
+}
+
+impl Serialize for RatchetState {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        PersistedRatchetState {
+            sending_sk: self.sending_sk.to_bytes(),
+            receiving_pk: self.receiving_pk.map(|pk| *pk.as_bytes()),
+            receiving_counter: self.receiving_counter,
+            sending_counter: self.sending_counter,
+            root_key: self.root_key,
+            chain_key_sending: self.chain_key_sending,
+            chain_key_receiving: self.chain_key_receiving,
+            skipped_message_keys: self
+                .skipped_message_keys
+                .iter()
+                .map(|(id, message_key)| (id.clone(), *message_key))
+                .collect(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RatchetState {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let persisted = PersistedRatchetState::deserialize(deserializer)?;
+        if persisted.skipped_message_keys.len() > MAX_SKIPPED_KEYS {
+            return Err(D::Error::custom("too many persisted skipped message keys"));
+        }
+
+        let mut skipped_message_keys = HashMap::with_capacity(persisted.skipped_message_keys.len());
+        for (id, message_key) in persisted.skipped_message_keys {
+            if skipped_message_keys.insert(id, message_key).is_some() {
+                return Err(D::Error::custom("duplicate persisted skipped message key"));
+            }
+        }
+
+        let sending_sk = ecdh::StaticSecret::from(persisted.sending_sk);
+        let sending_pk = ecdh::PublicKey::from(&sending_sk);
+        Ok(Self {
+            sending_sk,
+            sending_pk,
+            receiving_pk: persisted.receiving_pk.map(ecdh::PublicKey::from),
+            receiving_counter: persisted.receiving_counter,
+            sending_counter: persisted.sending_counter,
+            root_key: persisted.root_key,
+            chain_key_sending: persisted.chain_key_sending,
+            chain_key_receiving: persisted.chain_key_receiving,
+            skipped_message_keys,
+        })
+    }
 }
 
 fn header_aad(aditionnal_data: &[u8], header: &RatchetMessageHeader) -> Vec<u8> {
@@ -154,6 +226,17 @@ impl RatchetState {
     /// public key in the message header is different from the current receiving public key, it
     /// performs a ratchet step to update the root key and chain keys.
     pub fn receive_message(
+        &mut self,
+        message: RatchetMessage,
+        aditionnal_data: &[u8],
+    ) -> Result<String> {
+        let mut next = self.clone();
+        let plaintext = next.receive_message_inner(message, aditionnal_data)?;
+        *self = next;
+        Ok(plaintext)
+    }
+
+    fn receive_message_inner(
         &mut self,
         message: RatchetMessage,
         aditionnal_data: &[u8],
