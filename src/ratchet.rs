@@ -136,6 +136,12 @@ fn header_aad(aditionnal_data: &[u8], header: &RatchetMessageHeader) -> Vec<u8> 
     aad
 }
 
+impl Default for RatchetState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RatchetState {
     pub fn new() -> RatchetState {
         let mut rng = rand::thread_rng();
@@ -173,13 +179,21 @@ impl RatchetState {
         state
     }
 
-    // as_receiver initializes the RatchetState for the receiver of the conversation. It takes a
-    // shared key.
-    pub fn as_receiver(shared_key: [u8; 32]) -> RatchetState {
-        let mut state = RatchetState::new();
-        state.root_key = shared_key;
-
-        state
+    // as_receiver initializes the RatchetState for the receiver of the conversation using the
+    // signed prekey that participated in the initial key exchange.
+    pub fn as_receiver(shared_key: [u8; 32], sending_sk: ecdh::StaticSecret) -> RatchetState {
+        let sending_pk = ecdh::PublicKey::from(&sending_sk);
+        RatchetState {
+            sending_sk,
+            sending_pk,
+            receiving_pk: None,
+            receiving_counter: 0,
+            sending_counter: 0,
+            root_key: shared_key,
+            chain_key_sending: [0u8; 32],
+            chain_key_receiving: [0u8; 32],
+            skipped_message_keys: HashMap::new(),
+        }
     }
 
     /// send_message encrypts a message using the current sending chain key and returns a
@@ -204,7 +218,7 @@ impl RatchetState {
         };
 
         // ENCRYPT(mk, plaintext, AD || header)
-        let mut cipher = ChaCha20Poly1305::new(&message_key.try_into()?);
+        let mut cipher = ChaCha20Poly1305::new((&message_key).into());
         let aad = header_aad(aditionnal_data, &header);
         let ciphertext = cipher
             .encrypt(
@@ -214,7 +228,7 @@ impl RatchetState {
                     aad: &aad,
                 },
             )
-            .map_err(|e| anyhow!("failed to encrypt message: {}", e.to_string()))?;
+            .map_err(|e| anyhow!("failed to encrypt message: {}", e))?;
 
         let message = RatchetMessage { header, ciphertext };
         self.sending_counter += 1;
@@ -259,7 +273,7 @@ impl RatchetState {
 
             // generate a new Diffie-Hellman keypair
             // state.DHs = GENERATE_DH()
-            self.sending_sk = x25519::StaticSecret::random_from_rng(&mut rand::thread_rng());
+            self.sending_sk = x25519::StaticSecret::random_from_rng(rand::thread_rng());
             self.sending_pk = x25519::PublicKey::from(&self.sending_sk);
 
             // state.RK, state.CKs = KDF_RK(state.RK, DH(state.DHs, state.DHr))
@@ -328,7 +342,7 @@ impl RatchetState {
                     aad: &aad,
                 },
             )
-            .map_err(|e| anyhow!("failed to decrypt message: {}", e.to_string()))?;
+            .map_err(|e| anyhow!("failed to decrypt message: {}", e))?;
         Ok(String::from_utf8(plaintext)?)
     }
 }
@@ -347,7 +361,7 @@ fn kdf_root_key(key: &[u8; 32], shared_secret: ecdh::SharedSecret) -> ([u8; 32],
     let mut chain_key = [0u8; 32];
     xof.fill(&mut chain_key);
 
-    return (root_key, chain_key);
+    (root_key, chain_key)
 }
 
 /// kdf_chain_key derives a new chain key and message key from the current chain key.
@@ -362,7 +376,7 @@ fn kdf_chain_key(key: &[u8]) -> ([u8; 32], [u8; 32]) {
     let mut message_key = [0u8; 32];
     xof.fill(&mut message_key);
 
-    return (chain_key, message_key);
+    (chain_key, message_key)
 }
 
 #[cfg(test)]

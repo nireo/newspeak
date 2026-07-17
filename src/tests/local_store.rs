@@ -261,7 +261,8 @@ async fn conversation_roundtrip_preserves_skipped_message_keys() -> Result<()> {
     storage.load_or_create_user("bob").await?;
 
     let shared_key: [u8; 32] = rand::random();
-    let mut bob = RatchetState::as_receiver(shared_key);
+    let bob_sk = x25519::StaticSecret::random_from_rng(rand::thread_rng());
+    let mut bob = RatchetState::as_receiver(shared_key, bob_sk);
     let mut alice = RatchetState::as_initiator(shared_key, bob.sending_pk);
     let aad = b"ratchet-ad";
     let first = alice.send_message("one", aad)?;

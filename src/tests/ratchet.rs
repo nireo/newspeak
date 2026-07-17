@@ -1,9 +1,14 @@
 use super::*;
 
+fn receiver(shared_key: [u8; 32]) -> RatchetState {
+    let sending_sk = ecdh::StaticSecret::random_from_rng(rand::thread_rng());
+    RatchetState::as_receiver(shared_key, sending_sk)
+}
+
 #[test]
 fn ratchet_allows_initiator_to_send_and_receiver_to_decrypt() {
     let shared_key: [u8; 32] = rand::random();
-    let mut bob = RatchetState::as_receiver(shared_key);
+    let mut bob = receiver(shared_key);
 
     let bob_pk = ecdh::PublicKey::from(&bob.sending_sk);
 
@@ -24,12 +29,10 @@ fn ratchet_allows_initiator_to_send_and_receiver_to_decrypt() {
 #[test]
 fn ratchet_allows_bidirectional_messages() {
     let shared_key: [u8; 32] = rand::random();
-    let mut bob = RatchetState::new();
-    let bob_initial_pk = ecdh::PublicKey::from(&bob.sending_sk);
+    let mut bob = receiver(shared_key);
+    let bob_initial_pk = bob.sending_pk;
 
     let mut alice = RatchetState::as_initiator(shared_key, bob_initial_pk);
-
-    bob.root_key = shared_key;
 
     let ad = b"ratchet-ad";
     let to_bob = alice.send_message("ping", ad).unwrap();
@@ -49,11 +52,8 @@ fn ratchet_allows_bidirectional_messages() {
 #[should_panic]
 fn ratchet_rejects_message_with_wrong_additional_data() {
     let shared_key: [u8; 32] = rand::random();
-    let bob = RatchetState::new();
-    let bob_pk = ecdh::PublicKey::from(&bob.sending_sk);
-
-    let mut alice = RatchetState::as_initiator(shared_key, bob_pk);
-    let mut bob = RatchetState::as_receiver(shared_key);
+    let mut bob = receiver(shared_key);
+    let mut alice = RatchetState::as_initiator(shared_key, bob.sending_pk);
 
     let message = alice.send_message("secret", b"correct-ad").unwrap();
     bob.receive_message(message, b"incorrect-ad").unwrap();
@@ -62,11 +62,8 @@ fn ratchet_rejects_message_with_wrong_additional_data() {
 #[test]
 fn ratchet_rejects_message_with_tampered_counter() {
     let shared_key: [u8; 32] = rand::random();
-    let bob = RatchetState::new();
-
-    let bob_pk = ecdh::PublicKey::from(&bob.sending_sk);
-    let mut alice = RatchetState::as_initiator(shared_key, bob_pk);
-    let mut bob = RatchetState::as_receiver(shared_key);
+    let mut bob = receiver(shared_key);
+    let mut alice = RatchetState::as_initiator(shared_key, bob.sending_pk);
 
     let ad = b"ratchet-ad";
     let mut message = alice.send_message("secret", ad).unwrap();
@@ -77,7 +74,7 @@ fn ratchet_rejects_message_with_tampered_counter() {
 #[test]
 fn failed_authentication_does_not_advance_ratchet_state() {
     let shared_key: [u8; 32] = rand::random();
-    let mut bob = RatchetState::as_receiver(shared_key);
+    let mut bob = receiver(shared_key);
     let mut alice = RatchetState::as_initiator(shared_key, bob.sending_pk);
 
     let ad = b"ratchet-ad";
@@ -94,7 +91,7 @@ fn failed_authentication_does_not_advance_ratchet_state() {
 #[test]
 fn failed_authentication_does_not_consume_skipped_key() {
     let shared_key: [u8; 32] = rand::random();
-    let mut bob = RatchetState::as_receiver(shared_key);
+    let mut bob = receiver(shared_key);
     let mut alice = RatchetState::as_initiator(shared_key, bob.sending_pk);
 
     let ad = b"ratchet-ad";
@@ -111,7 +108,7 @@ fn failed_authentication_does_not_consume_skipped_key() {
 #[test]
 fn ratchet_handles_out_of_order_messages() {
     let shared_key: [u8; 32] = rand::random();
-    let mut bob = RatchetState::as_receiver(shared_key);
+    let mut bob = receiver(shared_key);
     let bob_pk = ecdh::PublicKey::from(&bob.sending_sk);
     let mut alice = RatchetState::as_initiator(shared_key, bob_pk);
 

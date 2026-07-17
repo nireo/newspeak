@@ -22,7 +22,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
-use x25519_dalek as x25519;
 
 enum TuiInboundEvent {
     Message(ServerMessage),
@@ -568,9 +567,7 @@ impl TuiAppState {
             self.set_status(format!("failed to mark one-time kem key used: {}", err));
         }
 
-        let mut ratchet = RatchetState::as_receiver(shared_key);
-        ratchet.sending_sk = sending_sk;
-        ratchet.sending_pk = x25519::PublicKey::from(&ratchet.sending_sk);
+        let ratchet = RatchetState::as_receiver(shared_key, sending_sk);
         storage
             .update_conversation(username, &message.sender_id, &ratchet)
             .await?;

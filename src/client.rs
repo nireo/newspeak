@@ -169,8 +169,8 @@ impl<'a> User<'a> {
         let init_message = init_output.message;
 
         let ratchet_state = RatchetState::as_initiator(
-            init_output.secret_key.clone(),
-            prekey_bundle.signed_prekey.public_key.clone(),
+            init_output.secret_key,
+            prekey_bundle.signed_prekey.public_key,
         );
 
         // the initial message contains all information that the receiver needs to complete the key
@@ -478,10 +478,15 @@ pub async fn run() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn receiver(shared_key: [u8; 32]) -> RatchetState {
+        let sending_sk = x25519::StaticSecret::random_from_rng(rand::thread_rng());
+        RatchetState::as_receiver(shared_key, sending_sk)
+    }
+
     #[test]
     fn ratchet_aad_allows_valid_metadata() {
         let shared_key: [u8; 32] = rand::random();
-        let mut bob = RatchetState::as_receiver(shared_key);
+        let mut bob = receiver(shared_key);
         let bob_pk = x25519::PublicKey::from(&bob.sending_sk);
         let mut alice = RatchetState::as_initiator(shared_key, bob_pk);
 
@@ -495,7 +500,7 @@ mod tests {
     #[test]
     fn ratchet_aad_rejects_mismatched_metadata() {
         let shared_key: [u8; 32] = rand::random();
-        let mut bob = RatchetState::as_receiver(shared_key);
+        let mut bob = receiver(shared_key);
         let bob_pk = x25519::PublicKey::from(&bob.sending_sk);
         let mut alice = RatchetState::as_initiator(shared_key, bob_pk);
 
