@@ -47,6 +47,12 @@ pub struct KeyStore<I: Hash + Eq, T: Clone> {
     store: HashMap<I, OneTimeKey<T>>,
 }
 
+impl<I: Hash + Eq, T: Clone> Default for KeyStore<I, T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<I: Hash + Eq, T: Clone> KeyStore<I, T> {
     pub fn new() -> Self {
         Self {
@@ -66,34 +72,22 @@ impl<I: Hash + Eq, T: Clone> KeyStore<I, T> {
         self.store.len()
     }
 
-    pub fn get_id(&self, id: &I) -> Option<&OneTimeKey<T>> {
-        self.store.get(id)
+    pub fn is_empty(&self) -> bool {
+        self.store.is_empty()
     }
 
     pub fn mark_used(&mut self, id: &I) {
-        if let Some(val) = self.store.get_mut(&id) {
+        if let Some(val) = self.store.get_mut(id) {
             val.used = true;
         }
     }
 
     pub fn insert(&mut self, id: I, key: T) {
-        self.store.insert(
-            id,
-            OneTimeKey {
-                key: key,
-                used: false,
-            },
-        );
+        self.store.insert(id, OneTimeKey { key, used: false });
     }
 
     pub fn insert_with_used(&mut self, id: I, key: T, used: bool) {
-        self.store.insert(
-            id,
-            OneTimeKey {
-                key: key,
-                used: used,
-            },
-        );
+        self.store.insert(id, OneTimeKey { key, used });
     }
 
     pub fn first_unused(&self) -> Option<(&I, &OneTimeKey<T>)> {
@@ -200,6 +194,12 @@ pub struct PrekeyBundle {
     pub one_time_prekey: Option<PublicSignedPrekey>,
     pub one_time_prekey_id: Option<u32>,
     pub kem_id: KemId,
+}
+
+impl Default for KeyExchangeUser {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl KeyExchangeUser {
@@ -313,16 +313,13 @@ impl KeyExchangeUser {
             one_time_prekey_used: other.one_time_prekey_id,
         };
 
-        return Ok(PQXDHInitOutput {
+        Ok(PQXDHInitOutput {
             secret_key,
             message: init_message,
-        });
+        })
     }
 
-    pub fn receive_key_exchange(
-        self: &KeyExchangeUser,
-        message: &PQXDHInitMessage,
-    ) -> Result<[u8; 32], Error> {
+    pub fn receive_key_exchange(&self, message: &PQXDHInitMessage) -> Result<[u8; 32], Error> {
         let kem_key = if message.kem_used == self.last_resort_id {
             &self.last_resort_kem
         } else if let Some(kem_key) = self.one_time_kem_keys.get(&message.kem_used) {
@@ -353,25 +350,20 @@ impl KeyExchangeUser {
             .private_key
             .diffie_hellman(&message.ephemeral_x25519_public_key);
 
-        let mut dh_4: Option<[u8; 32]> = None;
-        if let Some(otpk_id) = message.one_time_prekey_used {
-            match self.one_time_keys.get_id(&otpk_id) {
-                Some(skey) => {
-                    dh_4 = Some(
-                        skey.key
-                            .private_key
-                            .diffie_hellman(&message.ephemeral_x25519_public_key)
-                            .to_bytes(),
-                    )
-                }
-                None => {
-                    println!("otpk key not found {}", otpk_id);
-                    return Err(Error::msg(
-                        "cannot create shared secret due to missing one-time-key used.",
-                    ));
-                }
-            }
-        }
+        let dh_4 = message
+            .one_time_prekey_used
+            .map(|id| {
+                let prekey = self.one_time_keys.get(&id).ok_or_else(|| {
+                    Error::msg(format!("one-time prekey {id} not found for key exchange"))
+                })?;
+                Ok::<_, Error>(
+                    prekey
+                        .private_key
+                        .diffie_hellman(&message.ephemeral_x25519_public_key)
+                        .to_bytes(),
+                )
+            })
+            .transpose()?;
 
         // SK = KDF(DH1 || DH2 || DH3 || SS)
         let secret_key = kdf(
@@ -382,7 +374,7 @@ impl KeyExchangeUser {
             &mlkem_shared_secret,
         );
 
-        return Ok(secret_key);
+        Ok(secret_key)
     }
 }
 
@@ -426,16 +418,16 @@ fn kdf(
     kdf.update(mlkem_shared_secret);
     kdf.update(KDF_INFO);
     kdf.finalize_xof_into(&mut secret_key);
-    return secret_key;
+    secret_key
 }
 
 fn ed25519_sk_to_x25519(ed25519_secret_key: &ed25519::SigningKey) -> x25519::StaticSecret {
-    return x25519::StaticSecret::from(ed25519_secret_key.to_scalar_bytes());
+    x25519::StaticSecret::from(ed25519_secret_key.to_scalar_bytes())
 }
 
 fn ed25519_pk_to_x25519(ed25519_public_key: &ed25519::VerifyingKey) -> x25519::PublicKey {
     // u = (1 + y) / (1 - y) = (Z + Y) / (Z - Y)
-    return x25519::PublicKey::from(ed25519_public_key.to_montgomery().to_bytes());
+    x25519::PublicKey::from(ed25519_public_key.to_montgomery().to_bytes())
 }
 
 #[cfg(test)]

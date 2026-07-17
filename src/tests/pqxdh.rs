@@ -1,6 +1,13 @@
 use super::SignerMut;
 use super::*;
 
+#[test]
+fn key_store_default_is_empty() {
+    let store = KeyStore::<u32, SignedPrekey>::default();
+    assert!(store.is_empty());
+    assert_eq!(store.len(), 0);
+}
+
 impl KeyExchangeUser {
     fn make_prekey(&self) -> PrekeyBundle {
         let one_time_prekey = self.one_time_keys.first_unused();

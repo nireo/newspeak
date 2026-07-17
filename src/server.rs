@@ -154,15 +154,15 @@ impl NewspeakService {
         timestamp: &prost_types::Timestamp,
     ) {
         match message.message_type.as_mut() {
-            Some(client_message::MessageType::KeyExchangeMessage(inner)) => {
-                if inner.timestamp.is_none() {
-                    inner.timestamp = Some(timestamp.clone());
-                }
+            Some(client_message::MessageType::KeyExchangeMessage(inner))
+                if inner.timestamp.is_none() =>
+            {
+                inner.timestamp = Some(*timestamp);
             }
-            Some(client_message::MessageType::EncryptedMessage(inner)) => {
-                if inner.timestamp.is_none() {
-                    inner.timestamp = Some(timestamp.clone());
-                }
+            Some(client_message::MessageType::EncryptedMessage(inner))
+                if inner.timestamp.is_none() =>
+            {
+                inner.timestamp = Some(*timestamp);
             }
             _ => {}
         }
