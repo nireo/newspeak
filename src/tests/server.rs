@@ -34,7 +34,11 @@ fn signed_prekey(signing_key: &SigningKey, kind: KeyKind, key: &[u8], id: u32) -
 async fn test_service() -> NewspeakService {
     let db = SqlitePoolOptions::new()
         .max_connections(1)
-        .connect("sqlite::memory:")
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(":memory:")
+                .foreign_keys(true),
+        )
         .await
         .unwrap();
     init_db(&db).await.unwrap();

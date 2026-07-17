@@ -3,7 +3,7 @@ use std::path::Path;
 
 use ed25519_dalek::Signer;
 use ml_kem::{Encoded, EncodedSizeUser, MlKem1024Params, kem::DecapsulationKey};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePoolOptions};
 use sqlx::{Row, Sqlite, SqlitePool};
 use x25519_dalek as x25519;
 
@@ -40,8 +40,8 @@ struct StoredUser {
     identity_sk: [u8; 32],
     signed_prekey_sk: [u8; 32],
     kem_decap: Vec<u8>,
-    kem_store: Option<KeyStore<KemId, SignedMlKemPrekey>>,
-    ec_store: Option<KeyStore<u32, SignedPrekey>>,
+    kem_store: KeyStore<KemId, SignedMlKemPrekey>,
+    ec_store: KeyStore<u32, SignedPrekey>,
 }
 
 type SqliteQuery<'a> = sqlx::query::Query<'a, Sqlite, sqlx::sqlite::SqliteArguments<'a>>;
@@ -83,15 +83,11 @@ impl LocalKeyId {
 
 impl LocalStorage {
     async fn insert_key_rows(
-        &self,
+        connection: &mut SqliteConnection,
         username: &str,
         rows: Vec<(LocalKeyId, Vec<u8>, i64)>,
         table: LocalKeyTable,
     ) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let username = username.to_string();
         let sql = format!(
             "INSERT INTO {} (
                 id,
@@ -103,13 +99,11 @@ impl LocalStorage {
             table.key_column()
         );
 
-        let mut tx = self.db.begin().await?;
         for (id, key_bytes, used) in rows {
             let query = sqlx::query(&sql);
-            let query = id.bind(query).bind(&username).bind(&key_bytes).bind(used);
-            query.execute(&mut *tx).await?;
+            let query = id.bind(query).bind(username).bind(key_bytes).bind(used);
+            query.execute(&mut *connection).await?;
         }
-        tx.commit().await?;
         Ok(())
     }
 
@@ -127,11 +121,9 @@ impl LocalStorage {
             table.name()
         );
 
-        let mut tx = self.db.begin().await?;
         let query = sqlx::query(&sql).bind(&username);
         let query = id.bind(query);
-        query.execute(&mut *tx).await?;
-        tx.commit().await?;
+        query.execute(&self.db).await?;
         Ok(())
     }
 
@@ -194,8 +186,8 @@ impl LocalStorage {
             identity_sk: bytes_to_32(&identity_sk)?,
             signed_prekey_sk: bytes_to_32(&signed_prekey_sk)?,
             kem_decap,
-            kem_store: Some(kem_store),
-            ec_store: Some(ec_store),
+            kem_store,
+            ec_store,
         }))
     }
 
@@ -219,86 +211,106 @@ impl LocalStorage {
     }
 
     async fn insert_user(&self, username: &str, user: &pqxdh::KeyExchangeUser) -> Result<()> {
-        let identity_sk = user.identity_sk.as_bytes().to_vec();
-        let signed_prekey_sk = user.signed_prekey.private_key.to_bytes().to_vec();
-        let kem_decap = user
-            .last_resort_kem
-            .decap_key
-            .as_bytes()
-            .as_slice()
-            .to_vec();
-        let username_owned = username.to_string();
+        let identity_sk = user.identity_sk.as_bytes();
+        let signed_prekey_sk = user.signed_prekey.private_key.to_bytes();
+        let kem_decap = user.last_resort_kem.decap_key.as_bytes();
 
-        {
-            let mut tx = self.db.begin().await?;
-            sqlx::query(
-                "INSERT INTO local_users (
-                    username,
-                    identity_sk,
-                    signed_prekey_sk,
-                    kem_decap
-                ) VALUES (?1, ?2, ?3, ?4)",
-            )
-            .bind(&username_owned)
-            .bind(&identity_sk)
-            .bind(&signed_prekey_sk)
-            .bind(&kem_decap)
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
-        }
+        let mut tx = self.db.begin().await?;
+        sqlx::query(
+            "INSERT INTO local_users (
+                username,
+                identity_sk,
+                signed_prekey_sk,
+                kem_decap
+            ) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(username)
+        .bind(identity_sk.as_slice())
+        .bind(signed_prekey_sk.as_slice())
+        .bind(kem_decap.as_slice())
+        .execute(&mut *tx)
+        .await?;
 
-        self.insert_kem_keys(&username, &user.one_time_kem_keys)
-            .await?;
-        self.insert_ec_keys(&username, &user.one_time_keys).await?;
-
+        Self::insert_key_rows(
+            &mut tx,
+            username,
+            Self::kem_key_rows(&user.one_time_kem_keys),
+            LocalKeyTable::Kem,
+        )
+        .await?;
+        Self::insert_key_rows(
+            &mut tx,
+            username,
+            Self::ec_key_rows(&user.one_time_keys),
+            LocalKeyTable::Ec,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
+    fn kem_key_rows(
+        keys: &pqxdh::KeyStore<pqxdh::KemId, pqxdh::SignedMlKemPrekey>,
+    ) -> Vec<(LocalKeyId, Vec<u8>, i64)> {
+        keys.iter()
+            .map(|(id, key, used)| {
+                (
+                    LocalKeyId::Blob(id.to_vec()),
+                    key.decap_key.as_bytes().as_slice().to_vec(),
+                    i64::from(used),
+                )
+            })
+            .collect()
+    }
+
+    fn ec_key_rows(
+        keys: &pqxdh::KeyStore<u32, pqxdh::SignedPrekey>,
+    ) -> Vec<(LocalKeyId, Vec<u8>, i64)> {
+        keys.iter()
+            .map(|(id, key, used)| {
+                (
+                    LocalKeyId::Int(i64::from(*id)),
+                    key.private_key.as_bytes().to_vec(),
+                    i64::from(used),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     async fn insert_kem_keys(
         &self,
         username: &str,
         keys: &pqxdh::KeyStore<pqxdh::KemId, pqxdh::SignedMlKemPrekey>,
     ) -> Result<()> {
-        let rows: Vec<(pqxdh::KemId, Vec<u8>, i64)> = keys
-            .iter()
-            .map(|(id, key, used)| {
-                (
-                    *id,
-                    key.decap_key.as_bytes().as_slice().to_vec(),
-                    if used { 1 } else { 0 },
-                )
-            })
-            .collect();
-        let rows = rows
-            .into_iter()
-            .map(|(id, key_bytes, used)| (LocalKeyId::Blob(id.to_vec()), key_bytes, used))
-            .collect();
-        self.insert_key_rows(username, rows, LocalKeyTable::Kem)
-            .await
+        let mut tx = self.db.begin().await?;
+        Self::insert_key_rows(
+            &mut tx,
+            username,
+            Self::kem_key_rows(keys),
+            LocalKeyTable::Kem,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
+    #[cfg(test)]
     async fn insert_ec_keys(
         &self,
         username: &str,
         keys: &pqxdh::KeyStore<u32, pqxdh::SignedPrekey>,
     ) -> Result<()> {
-        let rows: Vec<(u32, Vec<u8>, i64)> = keys
-            .iter()
-            .map(|(id, key, used)| {
-                (
-                    *id,
-                    key.private_key.as_bytes().to_vec(),
-                    if used { 1 } else { 0 },
-                )
-            })
-            .collect();
-        let rows = rows
-            .into_iter()
-            .map(|(id, key_bytes, used)| (LocalKeyId::Int(i64::from(id)), key_bytes, used))
-            .collect();
-        self.insert_key_rows(username, rows, LocalKeyTable::Ec)
-            .await
+        let mut tx = self.db.begin().await?;
+        Self::insert_key_rows(
+            &mut tx,
+            username,
+            Self::ec_key_rows(keys),
+            LocalKeyTable::Ec,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn get_user_kem_keys(
@@ -433,24 +445,20 @@ impl LocalStorage {
         let username = username.to_string();
         let peer = peer.to_string();
 
-        {
-            let mut tx = self.db.begin().await?;
-            sqlx::query(
-                "INSERT INTO conversations (
-                    username,
-                    peer,
-                    ratchet_state
-                ) VALUES (?1, ?2, ?3)
-                ON CONFLICT(username, peer)
-                DO UPDATE SET ratchet_state = excluded.ratchet_state",
-            )
-            .bind(&username)
-            .bind(&peer)
-            .bind(&ratchet_state)
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
-        }
+        sqlx::query(
+            "INSERT INTO conversations (
+                username,
+                peer,
+                ratchet_state
+            ) VALUES (?1, ?2, ?3)
+            ON CONFLICT(username, peer)
+            DO UPDATE SET ratchet_state = excluded.ratchet_state",
+        )
+        .bind(&username)
+        .bind(&peer)
+        .bind(&ratchet_state)
+        .execute(&self.db)
+        .await?;
 
         Ok(())
     }
@@ -470,24 +478,20 @@ impl LocalStorage {
         let content = content.to_string();
         let is_sender = if is_sender { 1 } else { 0 };
 
-        {
-            let mut tx = self.db.begin().await?;
-            sqlx::query(
-                "INSERT INTO messages (
-                    conversation_id,
-                    content,
-                    is_sender,
-                    timestamp
-                ) VALUES (?1, ?2, ?3, ?4)",
-            )
-            .bind(conversation_id)
-            .bind(&content)
-            .bind(is_sender)
-            .bind(timestamp)
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
-        }
+        sqlx::query(
+            "INSERT INTO messages (
+                conversation_id,
+                content,
+                is_sender,
+                timestamp
+            ) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(conversation_id)
+        .bind(&content)
+        .bind(is_sender)
+        .bind(timestamp)
+        .execute(&self.db)
+        .await?;
 
         Ok(())
     }
@@ -604,7 +608,6 @@ impl LocalStorage {
 
         let username = username.to_string();
         let peer = peer.to_string();
-        let mut tx = self.db.begin().await?;
         sqlx::query(
             "INSERT INTO peer_identities (
                 username,
@@ -617,9 +620,8 @@ impl LocalStorage {
         .bind(&peer)
         .bind(identity_key.as_slice())
         .bind(0i64)
-        .execute(&mut *tx)
+        .execute(&self.db)
         .await?;
-        tx.commit().await?;
 
         Ok(PeerIdentityStoreResult::Inserted)
     }
@@ -627,7 +629,6 @@ impl LocalStorage {
     pub async fn mark_peer_identity_verified(&self, username: &str, peer: &str) -> Result<bool> {
         let username = username.to_string();
         let peer = peer.to_string();
-        let mut tx = self.db.begin().await?;
         let result = sqlx::query(
             "UPDATE peer_identities
              SET verified = 1
@@ -635,98 +636,14 @@ impl LocalStorage {
         )
         .bind(&username)
         .bind(&peer)
-        .execute(&mut *tx)
+        .execute(&self.db)
         .await?;
-        tx.commit().await?;
 
         Ok(result.rows_affected() > 0)
     }
 
-    async fn init_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-        // some thoughts on the schema: for a relational format it makes more sense to store the
-        // user like this, overall sqlite is very reliable and a good also for internal storage in
-        // my opinion.
-        //
-        // also having a blob as the kem key id seems quite weird, but it makes sense since they're
-        // internally stored that way and there is no point in having a different id column.
-        //
-        // we need to store the entire ratchet states for each conversation
-        //
-        // TODO: might be easier to store all content as bytes blos and deserialize on load,
-        //       but that would make queries harder if we want to do anything more complex later on
-
-        sqlx::query("PRAGMA foreign_keys = ON;")
-            .execute(pool)
-            .await?;
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS local_users (
-                username TEXT NOT NULL PRIMARY KEY,
-                identity_sk BLOB NOT NULL,
-                signed_prekey_sk BLOB NOT NULL,
-                kem_decap BLOB NOT NULL
-            );",
-        )
-        .execute(pool)
-        .await?;
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS kem_keys(
-                id BLOB PRIMARY KEY,
-                username TEXT NOT NULL,
-                decap BLOB NOT NULL,
-                used INTEGER NOT NULL,
-                FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
-            );",
-        )
-        .execute(pool)
-        .await?;
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS ec_keys(
-                id INTEGER PRIMARY KEY,
-                username TEXT NOT NULL,
-                sk BLOB NOT NULL,
-                used INTEGER NOT NULL,
-                FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
-            );",
-        )
-        .execute(pool)
-        .await?;
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS conversations(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL,
-                peer TEXT NOT NULL,
-                ratchet_state BLOB NOT NULL,
-                UNIQUE (username, peer),
-                FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
-            );",
-        )
-        .execute(pool)
-        .await?;
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS messages(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id INTEGER NOT NULL,
-                content TEXT NOT NULL,
-                is_sender INTEGER NOT NULL,
-                timestamp INTEGER NOT NULL,
-                FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-            );",
-        )
-        .execute(pool)
-        .await?;
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS peer_identities(
-                username TEXT NOT NULL,
-                peer TEXT NOT NULL,
-                identity_key BLOB NOT NULL,
-                verified INTEGER NOT NULL,
-                UNIQUE (username, peer),
-                FOREIGN KEY (username) REFERENCES local_users(username) ON DELETE CASCADE
-            );",
-        )
-        .execute(pool)
-        .await?;
-
+    async fn init_migrations(pool: &SqlitePool) -> Result<()> {
+        sqlx::migrate!("./migrations/local").run(pool).await?;
         Ok(())
     }
 }
@@ -761,8 +678,8 @@ fn stored_user_to_key_exchange_user(stored: StoredUser) -> Result<pqxdh::KeyExch
         signature: kem_sig,
     };
 
-    let one_time_keys = stored.ec_store.unwrap_or_else(pqxdh::KeyStore::new);
-    let one_time_kem_keys = stored.kem_store.unwrap_or_else(pqxdh::KeyStore::new);
+    let one_time_keys = stored.ec_store;
+    let one_time_kem_keys = stored.kem_store;
     let one_time_prekey_id = one_time_keys
         .iter()
         .map(|(id, _, _)| *id)

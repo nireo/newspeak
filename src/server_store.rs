@@ -170,8 +170,6 @@ impl ServerStore {
         receiver_username: &str,
         created_at: i64,
     ) -> Result<(), Status> {
-        let mut tx = self.db.begin().await.map_err(map_db_error)?;
-
         sqlx::query(
             "INSERT INTO offline_messages (
                 sender_username,
@@ -186,11 +184,9 @@ impl ServerStore {
         .bind(msg_data)
         .bind(msg_kind as i32)
         .bind(created_at)
-        .execute(&mut *tx)
+        .execute(&self.db)
         .await
         .map_err(map_db_error)?;
-
-        tx.commit().await.map_err(map_db_error)?;
 
         Ok(())
     }
@@ -203,8 +199,6 @@ impl ServerStore {
         receiver_username: &str,
         received_timestamp: i64,
     ) -> Result<(), Status> {
-        let mut tx = self.db.begin().await.map_err(map_db_error)?;
-
         sqlx::query(
             "DELETE FROM offline_messages
             WHERE receiver_username = ?1
@@ -212,11 +206,10 @@ impl ServerStore {
         )
         .bind(receiver_username)
         .bind(received_timestamp)
-        .execute(&mut *tx)
+        .execute(&self.db)
         .await
         .map_err(map_db_error)?;
 
-        tx.commit().await.map_err(map_db_error)?;
         Ok(())
     }
 
@@ -228,8 +221,6 @@ impl ServerStore {
         &self,
         username: &str,
     ) -> Result<Vec<StoredOfflineMessage>, Status> {
-        let mut tx = self.db.begin().await.map_err(map_db_error)?;
-
         let rows = sqlx::query(
             "SELECT id, message, created_at
             FROM offline_messages
@@ -237,7 +228,7 @@ impl ServerStore {
             ORDER BY created_at ASC, id ASC",
         )
         .bind(username)
-        .fetch_all(&mut *tx)
+        .fetch_all(&self.db)
         .await
         .map_err(map_db_error)?;
 
@@ -253,7 +244,6 @@ impl ServerStore {
             });
         }
 
-        tx.commit().await.map_err(map_db_error)?;
         Ok(messages)
     }
 
@@ -483,70 +473,8 @@ fn map_db_error(err: sqlx::Error) -> Status {
     }
 }
 
-pub async fn init_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query("PRAGMA foreign_keys = ON;")
-        .execute(pool)
-        .await?;
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE,
-            identity_key BLOB NOT NULL,
-            signed_prekey_kind INTEGER NOT NULL,
-            signed_prekey_key BLOB NOT NULL,
-            signed_prekey_signature BLOB NOT NULL,
-            kem_prekey_kind INTEGER NOT NULL,
-            kem_prekey_key BLOB NOT NULL,
-            kem_prekey_signature BLOB NOT NULL,
-            signed_prekey_created_at INTEGER
-        );",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username);")
-        .execute(pool)
-        .await?;
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS one_time_prekeys (
-            id INTEGER,
-            user_id INTEGER,
-            kind INTEGER NOT NULL,
-            key BLOB NOT NULL,
-            signature BLOB NOT NULL,
-            created_at INTEGER,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-            PRIMARY KEY (id, user_id)
-        );",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS offline_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sender_username TEXT NOT NULL,
-            receiver_username TEXT NOT NULL,
-            message BLOB NOT NULL,
-            message_kind INTEGER NOT NULL,
-            created_at INTEGER NOT NULL
-        );",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS one_time_kem_keys (
-            id INTEGER,
-            user_id INTEGER,
-            kind INTEGER NOT NULL,
-            key BLOB NOT NULL,
-            signature BLOB NOT NULL,
-            created_at INTEGER,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-            PRIMARY KEY (id, user_id)
-        );",
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
+pub async fn init_db(pool: &SqlitePool) -> Result<(), sqlx::migrate::MigrateError> {
+    sqlx::migrate!("./migrations/server").run(pool).await
 }
 
 #[cfg(test)]

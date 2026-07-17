@@ -185,6 +185,44 @@ async fn insert_user_persists_keys() -> Result<()> {
 }
 
 #[tokio::test]
+async fn insert_user_rolls_back_user_and_keys_on_failure() -> Result<()> {
+    let db = TempDb::new();
+    let storage = LocalStorage::new_with_path(&db.path).await?;
+    let conflicting_ec_id = 7;
+
+    let mut alice = pqxdh::KeyExchangeUser::new();
+    alice.one_time_keys = pqxdh::KeyStore::new();
+    alice.one_time_kem_keys = pqxdh::KeyStore::new();
+    let mut alice_identity = alice.identity_sk.clone();
+    alice.one_time_keys.insert(
+        conflicting_ec_id,
+        pqxdh::SignedPrekey::new(&mut rand::thread_rng(), &mut alice_identity),
+    );
+    storage.insert_user("alice", &alice).await?;
+
+    let mut bob = pqxdh::KeyExchangeUser::new();
+    bob.one_time_keys = pqxdh::KeyStore::new();
+    bob.one_time_kem_keys = pqxdh::KeyStore::new();
+    let mut bob_identity = bob.identity_sk.clone();
+    let bob_ec = pqxdh::SignedPrekey::new(&mut rand::thread_rng(), &mut bob_identity);
+    let bob_kem = pqxdh::SignedMlKemPrekey::new(&mut rand::thread_rng(), &mut bob_identity);
+    let bob_kem_id = pqxdh::kem_id_from_key(bob_kem.encap_key.as_bytes().as_slice());
+    bob.one_time_kem_keys.insert(bob_kem_id, bob_kem);
+    bob.one_time_keys.insert(conflicting_ec_id, bob_ec);
+
+    assert!(storage.insert_user("bob", &bob).await.is_err());
+    assert!(storage.load_user("bob").await?.is_none());
+    let bob_kem_count: i64 = sqlx::query("SELECT COUNT(*) FROM kem_keys WHERE username = ?1")
+        .bind("bob")
+        .fetch_one(&storage.db)
+        .await?
+        .get(0);
+    assert_eq!(bob_kem_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn conversation_roundtrip() -> Result<()> {
     let db = TempDb::new();
     let storage = LocalStorage::new_with_path(&db.path).await?;
