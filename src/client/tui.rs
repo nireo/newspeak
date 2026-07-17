@@ -10,9 +10,9 @@ use crate::{
     verification,
 };
 use anyhow::{Result, anyhow};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use prost_types::Timestamp;
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -20,14 +20,8 @@ use ratatui::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
-
-enum TuiInboundEvent {
-    Message(ServerMessage),
-    StreamError(String),
-    StreamClosed,
-}
+use tokio_stream::StreamExt;
 
 #[derive(Clone, Copy)]
 enum TuiLineKind {
@@ -194,13 +188,13 @@ impl TuiAppState {
         self.refresh_tui_conversations(storage, username).await?;
 
         self.safety_number = None;
-        if let Some(peer_identity) = storage.get_peer_identity(username, peer).await? {
-            if !peer_identity.verified {
-                self.safety_number = Some(verification::safety_number_string(
-                    &self.local_identity,
-                    &peer_identity.identity_key,
-                ));
-            }
+        if let Some(peer_identity) = storage.get_peer_identity(username, peer).await?
+            && !peer_identity.verified
+        {
+            self.safety_number = Some(verification::safety_number_string(
+                &self.local_identity,
+                &peer_identity.identity_key,
+            ));
         }
 
         self.set_status(format!("active conversation: {}", peer));
@@ -447,28 +441,6 @@ fn render_ratatui_chat(frame: &mut ratatui::Frame<'_>, app: &TuiAppState) {
     }
 }
 
-fn spawn_tui_inbound_task(
-    mut inbound: tonic::Streaming<ServerMessage>,
-    tx: mpsc::UnboundedSender<TuiInboundEvent>,
-) {
-    tokio::spawn(async move {
-        while let Some(message) = inbound.message().await.transpose() {
-            match message {
-                Ok(server_message) => {
-                    if tx.send(TuiInboundEvent::Message(server_message)).is_err() {
-                        return;
-                    }
-                }
-                Err(status) => {
-                    let _ = tx.send(TuiInboundEvent::StreamError(status.to_string()));
-                    return;
-                }
-            }
-        }
-        let _ = tx.send(TuiInboundEvent::StreamClosed);
-    });
-}
-
 impl TuiAppState {
     async fn handle_tui_key_exchange_message(
         &mut self,
@@ -608,53 +580,51 @@ impl TuiAppState {
         };
 
         let is_current = self.active_peer.as_deref() == Some(sender_id.as_str());
-        if is_current {
+        let mut stored_ratchet;
+        let ratchet = if is_current {
             if self.active_ratchet.is_none() {
                 self.active_ratchet = storage.get_conversation(username, &sender_id).await?;
             }
             let Some(ratchet) = self.active_ratchet.as_mut() else {
-                self.set_status("received message before key exchange");
+                self.set_status(format!(
+                    "received message before key exchange from {}",
+                    sender_id
+                ));
                 return Ok(());
             };
-            match ratchet.receive_message(ratchet_message, &aad) {
-                Ok(plaintext) => {
-                    storage
-                        .add_message(username, &sender_id, &plaintext, false, timestamp)
-                        .await?;
-                    storage
-                        .update_conversation(username, &sender_id, ratchet)
-                        .await?;
-                    self.push_line(timestamp, sender_id, plaintext, TuiLineKind::Incoming);
-                }
-                Err(err) => {
-                    self.set_status(format!("failed to receive message: {}", err));
-                }
-            }
-            return Ok(());
-        }
-
-        let Some(mut ratchet) = storage.get_conversation(username, &sender_id).await? else {
-            self.set_status(format!(
-                "received message before key exchange from {}",
-                sender_id
-            ));
-            return Ok(());
+            ratchet
+        } else {
+            let Some(ratchet) = storage.get_conversation(username, &sender_id).await? else {
+                self.set_status(format!(
+                    "received message before key exchange from {}",
+                    sender_id
+                ));
+                return Ok(());
+            };
+            stored_ratchet = ratchet;
+            &mut stored_ratchet
         };
-        match ratchet.receive_message(ratchet_message, &aad) {
-            Ok(plaintext) => {
-                storage
-                    .add_message(username, &sender_id, &plaintext, false, timestamp)
-                    .await?;
-                storage
-                    .update_conversation(username, &sender_id, &ratchet)
-                    .await?;
-                *self.unread_counts.entry(sender_id.clone()).or_insert(0) += 1;
-                self.ensure_conversation(&sender_id);
-                self.set_status(format!("new message from {}", sender_id));
-            }
+
+        let plaintext = match ratchet.receive_message(ratchet_message, &aad) {
+            Ok(plaintext) => plaintext,
             Err(err) => {
                 self.set_status(format!("failed to receive message: {}", err));
+                return Ok(());
             }
+        };
+        storage
+            .add_message(username, &sender_id, &plaintext, false, timestamp)
+            .await?;
+        storage
+            .update_conversation(username, &sender_id, ratchet)
+            .await?;
+
+        if is_current {
+            self.push_line(timestamp, sender_id, plaintext, TuiLineKind::Incoming);
+        } else {
+            *self.unread_counts.entry(sender_id.clone()).or_insert(0) += 1;
+            self.ensure_conversation(&sender_id);
+            self.set_status(format!("new message from {}", sender_id));
         }
 
         Ok(())
@@ -676,11 +646,11 @@ impl TuiAppState {
         let mut latest_timestamp: Option<Timestamp> = None;
         for offline in join.offline_messages {
             if let Some(timestamp) = offline.timestamp.as_ref() {
-                let update = latest_timestamp.as_ref().map_or(true, |current| {
-                    super::is_newer_timestamp(timestamp, current)
-                });
+                let update = latest_timestamp
+                    .as_ref()
+                    .is_none_or(|current| super::is_newer_timestamp(timestamp, current));
                 if update {
-                    latest_timestamp = Some(timestamp.clone());
+                    latest_timestamp = Some(*timestamp);
                 }
             }
 
@@ -717,37 +687,29 @@ impl TuiAppState {
         Ok(())
     }
 
-    async fn process_tui_server_event(
+    async fn process_tui_server_message(
         &mut self,
-        event: TuiInboundEvent,
+        server_message: ServerMessage,
         key_info: &Arc<Mutex<KeyExchangeUser>>,
         storage: &LocalStorage,
         username: &str,
         tx: &mpsc::Sender<ClientMessage>,
     ) -> Result<()> {
-        match event {
-            TuiInboundEvent::Message(server_message) => match server_message.message_type {
-                Some(server_message::MessageType::JoinResponse(join)) => {
-                    self.handle_tui_join_response(join, key_info, storage, username, tx)
-                        .await?;
-                }
-                Some(server_message::MessageType::KeyExchange(message)) => {
-                    self.handle_tui_key_exchange_message(message, key_info, storage, username)
-                        .await?;
-                }
-                Some(server_message::MessageType::Encrypted(message)) => {
-                    self.handle_tui_encrypted_message(message, storage, username)
-                        .await?;
-                }
-                None => {
-                    self.set_status("server sent an empty message");
-                }
-            },
-            TuiInboundEvent::StreamError(err) => {
-                self.set_status(format!("stream error: {}", err));
+        match server_message.message_type {
+            Some(server_message::MessageType::JoinResponse(join)) => {
+                self.handle_tui_join_response(join, key_info, storage, username, tx)
+                    .await?;
             }
-            TuiInboundEvent::StreamClosed => {
-                self.set_status("stream closed by server");
+            Some(server_message::MessageType::KeyExchange(message)) => {
+                self.handle_tui_key_exchange_message(message, key_info, storage, username)
+                    .await?;
+            }
+            Some(server_message::MessageType::Encrypted(message)) => {
+                self.handle_tui_encrypted_message(message, storage, username)
+                    .await?;
+            }
+            None => {
+                self.set_status("server sent an empty message");
             }
         }
         Ok(())
@@ -984,7 +946,7 @@ impl TuiAppState {
 
     async fn handle_tui_key_event(
         &mut self,
-        key: event::KeyEvent,
+        key: KeyEvent,
         user: &mut User<'_>,
         storage: &LocalStorage,
         tx: &mpsc::Sender<ClientMessage>,
@@ -1041,7 +1003,7 @@ pub async fn run(username: String, receiver_arg: Option<String>) -> Result<()> {
     let mut user = User::new(&username, client, key_info);
     user.register().await?;
 
-    let (tx, inbound) = user.setup_message_stream().await?;
+    let (tx, mut inbound) = user.setup_message_stream().await?;
     user.send_join_request(&tx).await?;
 
     let initial_receiver = receiver_arg.filter(|receiver| !receiver.trim().is_empty());
@@ -1056,22 +1018,12 @@ pub async fn run(username: String, receiver_arg: Option<String>) -> Result<()> {
     }
     app.refresh_tui_conversations(&storage, &username).await?;
 
-    let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
-    spawn_tui_inbound_task(inbound, inbound_tx);
-
+    let mut terminal_events = EventStream::new();
     let mut pending_initial_init = initial_receiver.clone();
+    let mut inbound_open = true;
     let mut terminal = ratatui::init();
     let run_result = async {
         loop {
-            while let Ok(event) = inbound_rx.try_recv() {
-                if let Err(err) = app
-                    .process_tui_server_event(event, &user.key_info, &storage, &username, &tx)
-                    .await
-                {
-                    app.set_status(format!("server handling failed: {}", err));
-                }
-            }
-
             if app.joined
                 && let Some(receiver) = pending_initial_init.take()
                 && let Err(err) = app
@@ -1083,22 +1035,53 @@ pub async fn run(username: String, receiver_arg: Option<String>) -> Result<()> {
                 app.set_status(format!("init failed: {}", err));
             }
 
-            if let Err(err) = app.refresh_tui_conversations(&storage, &username).await {
-                app.set_status(format!("failed to refresh conversations: {}", err));
-            }
-
             terminal.draw(|frame| render_ratatui_chat(frame, &app))?;
             if app.should_quit {
                 break Ok(());
             }
 
-            if event::poll(Duration::from_millis(40))?
-                && let Event::Key(key) = event::read()?
-                && let Err(err) = app
-                    .handle_tui_key_event(key, &mut user, &storage, &tx, &username)
-                    .await
-            {
-                app.set_status(format!("input handling failed: {}", err));
+            tokio::select! {
+                message = inbound.message(), if inbound_open => {
+                    match message {
+                        Ok(Some(server_message)) => {
+                            if let Err(err) = app
+                                .process_tui_server_message(
+                                    server_message,
+                                    &user.key_info,
+                                    &storage,
+                                    &username,
+                                    &tx,
+                                )
+                                .await
+                            {
+                                app.set_status(format!("server handling failed: {}", err));
+                            }
+                        }
+                        Ok(None) => {
+                            inbound_open = false;
+                            app.set_status("stream closed by server");
+                        }
+                        Err(err) => {
+                            inbound_open = false;
+                            app.set_status(format!("stream error: {}", err));
+                        }
+                    }
+                }
+                event = terminal_events.next() => {
+                    match event {
+                        Some(Ok(Event::Key(key))) => {
+                            if let Err(err) = app
+                                .handle_tui_key_event(key, &mut user, &storage, &tx, &username)
+                                .await
+                            {
+                                app.set_status(format!("input handling failed: {}", err));
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(err)) => break Err(err.into()),
+                        None => break Ok(()),
+                    }
+                }
             }
         }
     }
